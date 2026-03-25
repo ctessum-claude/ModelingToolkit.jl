@@ -33,6 +33,140 @@ $GENERATE_X_KWARGS
 
 All other keyword arguments are forwarded to [`build_function_wrapper`](@ref).
 """
+
+# --- ArrayOp hybrid codegen helpers ---
+
+"""
+Walk an ArrayOp expression tree to find Const-wrapped symbolic arrays,
+then register rewrites mapping them to the function argument (with offset).
+"""
+function _register_arrayop_rewrites!(states, arrayop_expr, dvs)
+    parent_arrays = Set{Any}()
+    _find_const_arrays!(parent_arrays, arrayop_expr)
+    for arr in parent_arrays
+        # Find offset: where does arr[1] appear in dvs?
+        first_elem = Symbolics.unwrap(arr[1])
+        offset = nothing
+        for (i, dv) in enumerate(dvs)
+            if isequal(Symbolics.unwrap(dv), first_elem)
+                offset = i - 1
+                break
+            end
+        end
+        offset === nothing && continue
+        arg1_name = Symbol("ˍ₋arg1")
+        if offset == 0
+            states.rewrites[arr] = arg1_name
+        else
+            n = length(arr)
+            states.rewrites[arr] = :(@view $arg1_name[$(offset + 1):$(offset + n)])
+        end
+    end
+end
+
+function _find_const_arrays!(result, expr)
+    expr = Symbolics.unwrap(expr)
+    expr isa SU.BasicSymbolic || return
+    SU.@match expr begin
+        SU.BSImpl.Const(; val) => begin
+            if val isa SU.BasicSymbolic && SU.is_array_shape(SU.shape(val))
+                push!(result, val)
+            end
+        end
+        SU.BSImpl.ArrayOp(; expr = inner) => _find_const_arrays!(result, inner)
+        _ => begin
+            if SU.iscall(expr)
+                for arg in SU.arguments(expr)
+                    _find_const_arrays!(result, arg)
+                end
+            end
+        end
+    end
+end
+
+"""
+Inject an ArrayOp ForLoop body into a scalar IIP function Expr.
+Extracts the loop from the ArrayOp IIP Expr and inserts it into the
+scalar function, writing to a view of the output array at `du_range`.
+"""
+function _inject_arrayop!(scalar_iip_expr, arrayop_iip_expr, du_range)
+    # Extract the ForLoop body from the ArrayOp IIP expr.
+    # Structure: function (ˍ₋out, args...) [@inbounds begin] <body> [end] end
+    ao_body = _extract_function_body(arrayop_iip_expr)
+
+    # Replace the output symbol (ˍ₋out) with a view into the scalar output
+    out_sym = Symbol("ˍ₋out")
+    view_sym = gensym(:_arrayop_view)
+    ao_body = _replace_sym(ao_body, out_sym, view_sym)
+
+    # Wrap in a let block that creates the view
+    wrapped = Expr(:let, :($view_sym = @view $out_sym[$du_range]), Expr(:block, ao_body))
+
+    # Inject into scalar function body before the final `nothing`
+    _insert_before_return!(scalar_iip_expr, wrapped)
+end
+
+function _extract_function_body(func_expr)
+    # func_expr is: :(function (args...) body end)
+    body = func_expr.args[2]
+    # If wrapped in @inbounds: body is :(macrocall @inbounds ... inner_body)
+    if Meta.isexpr(body, :macrocall) && body.args[1] === Symbol("@inbounds")
+        body = body.args[end]
+    end
+    # If wrapped in begin...end block
+    if Meta.isexpr(body, :block)
+        # Return the block contents (stripping LineNumberNodes)
+        stmts = filter(x -> !(x isa LineNumberNode), body.args)
+        return length(stmts) == 1 ? stmts[1] : Expr(:block, stmts...)
+    end
+    return body
+end
+
+function _replace_sym(expr, old::Symbol, new)
+    if expr isa Symbol
+        return expr === old ? new : expr
+    elseif expr isa Expr
+        return Expr(expr.head, [_replace_sym(a, old, new) for a in expr.args]...)
+    else
+        return expr
+    end
+end
+
+function _insert_before_return!(func_expr, code)
+    # Find the innermost block in the function body and insert code before `nothing`
+    body = func_expr.args[2]
+    _insert_in_block!(body, code)
+end
+
+function _insert_in_block!(expr, code)
+    if !isa(expr, Expr)
+        return false
+    end
+    # Look for @inbounds wrapper
+    if Meta.isexpr(expr, :macrocall) && expr.args[1] === Symbol("@inbounds")
+        return _insert_in_block!(expr.args[end], code)
+    end
+    if Meta.isexpr(expr, :block)
+        # Find the last `nothing` and insert before it
+        for i in length(expr.args):-1:1
+            if expr.args[i] === nothing || expr.args[i] === :nothing
+                insert!(expr.args, i, code)
+                return true
+            end
+        end
+        # No nothing found, just append
+        push!(expr.args, code)
+        return true
+    end
+    # Recurse into sub-expressions
+    for arg in expr.args
+        _insert_in_block!(arg, code) && return true
+    end
+    return false
+end
+
+# --- End ArrayOp helpers ---
+
 function generate_rhs(
         sys::System; implicit_dae = false,
         scalar = false, expression = Val{true}, wrap_gfw = Val{false},
@@ -49,14 +183,27 @@ function generate_rhs(
     ddvs = nothing
     extra_assignments = Assignment[]
 
-    # Flatten any ArrayOp equations into scalar equations for code generation.
-    # This is needed when using `complete()` instead of `mtkcompile()`, since
-    # `mtkcompile` flattens equations during structural simplification but
-    # `complete` preserves them. The flattening here is cheaper because it skips
-    # the structural simplification step.
+    # Detect ArrayOp equations and separate them from scalar equations.
+    # ArrayOp equations use Symbolics Path B (ForLoop codegen) while scalar
+    # equations use the standard Path C (SetArray codegen).
     has_array_eqs = any(eq -> Symbolics.isarraysymbolic(eq.lhs), eqs)
+    arrayop_eqs = Tuple{UnitRange{Int}, Equation}[]
     if has_array_eqs
-        eqs = flatten_equations(eqs)
+        scalar_eqs = Equation[]
+        scalar_outputidxs = Int[]
+        du_pos = 1
+        for eq in eqs
+            if Symbolics.isarraysymbolic(eq.lhs)
+                n = length(Symbolics.unwrap(eq.lhs))
+                push!(arrayop_eqs, (du_pos:du_pos+n-1, eq))
+                du_pos += n
+            else
+                push!(scalar_eqs, eq)
+                push!(scalar_outputidxs, du_pos)
+                du_pos += 1
+            end
+        end
+        eqs = scalar_eqs
     end
 
     # used for DAEProblem and ImplicitDiscreteProblem
@@ -114,10 +261,32 @@ function generate_rhs(
         p_start += 1
     end
 
+    # Generate scalar part via standard pipeline (Path C)
+    scalar_kwargs = has_array_eqs ? (; outputidxs = scalar_outputidxs, kwargs...) : (; kwargs...)
     res = build_function_wrapper(
         sys, rhss, args...; p_start, extra_assignments,
-        expression = Val{true}, expression_module = eval_module, kwargs...
+        expression = Val{true}, expression_module = eval_module, scalar_kwargs...
     )
+
+    # For ArrayOp equations: generate ForLoop code via Symbolics Path B,
+    # then inject into the scalar IIP function.
+    if has_array_eqs
+        for (du_range, aopeq) in arrayop_eqs
+            arrayop_rhs = aopeq.rhs
+            # Pre-populate states with parent array rewrites so Const(u_arr)
+            # resolves to the function argument during toexpr
+            ao_states = SU.LazyState()
+            _register_arrayop_rewrites!(ao_states, Symbolics.unwrap(arrayop_rhs), dvs)
+            # Generate ForLoop code using existing Symbolics Path B
+            _, iip_ao = Symbolics.build_function(
+                Symbolics.Arr(arrayop_rhs), args...;
+                expression = Val{true}, states = ao_states,
+                iip_config = (false, true)
+            )
+            # Inject ArrayOp ForLoop into scalar IIP function
+            _inject_arrayop!(res[2], iip_ao, du_range)
+        end
+    end
     nargs = length(args) - length(p) + 1
     if is_dde(sys)
         p_start += 1
