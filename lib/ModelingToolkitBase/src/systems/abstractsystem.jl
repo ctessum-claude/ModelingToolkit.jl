@@ -3008,26 +3008,48 @@ function Base.eltype(::Type{<:TreeIterator{ModelingToolkitBase.AbstractSystem}})
     return ModelingToolkitBase.AbstractSystem
 end
 
-function check_array_equations_unknowns(eqs, dvs)
-    if any(eq -> eq isa Equation && Symbolics.isarraysymbolic(eq.lhs), eqs)
-        throw(ArgumentError("The system has array equations. Call `mtkcompile` to handle such equations or scalarize them manually."))
-    end
-    return if any(x -> Symbolics.isarraysymbolic(x), dvs)
+function check_array_equations_unknowns(eqs, dvs; allow_array_eqs = false)
+    has_array_dvs = any(x -> Symbolics.isarraysymbolic(x), dvs)
+    has_array_eqs = any(eq -> eq isa Equation && Symbolics.isarraysymbolic(eq.lhs), eqs)
+    if has_array_dvs
         throw(ArgumentError("The system has array unknowns. Call `mtkcompile` to handle this or scalarize them manually."))
+    end
+    if has_array_eqs && !allow_array_eqs
+        throw(ArgumentError("The system has array equations. Call `mtkcompile` to handle such equations, scalarize them manually, or pass `allow_array_eqs = true` if the system is already in explicit ODE form with scalar unknowns."))
     end
 end
 
+"""
+    effective_equation_count(eqs)
+
+Count the effective number of scalar equations, expanding ArrayOp equation sizes.
+An ArrayOp equation with shape (N,) counts as N scalar equations.
+"""
+function effective_equation_count(eqs)
+    n = 0
+    for eq in eqs
+        lhs = Symbolics.unwrap(eq.lhs)
+        if SU.is_array_shape(SU.shape(lhs))
+            n += length(lhs)
+        else
+            n += 1
+        end
+    end
+    return n
+end
+
 function check_eqs_u0(eqs, dvs, u0; check_length = true, kwargs...)
+    neqs = effective_equation_count(eqs)
     if u0 !== nothing
         if check_length
-            if !(length(eqs) == length(dvs) == length(u0))
-                throw(ArgumentError("Equations ($(length(eqs))), unknowns ($(length(dvs))), and initial conditions ($(length(u0))) are of different lengths."))
+            if !(neqs == length(dvs) == length(u0))
+                throw(ArgumentError("Equations ($neqs effective), unknowns ($(length(dvs))), and initial conditions ($(length(u0))) are of different lengths."))
             end
         elseif length(dvs) != length(u0)
             throw(ArgumentError("Unknowns ($(length(dvs))) and initial conditions ($(length(u0))) are of different lengths."))
         end
-    elseif check_length && (length(eqs) != length(dvs))
-        throw(ArgumentError("Equations ($(length(eqs))) and Unknowns ($(length(dvs))) are of different lengths."))
+    elseif check_length && (neqs != length(dvs))
+        throw(ArgumentError("Equations ($neqs effective) and Unknowns ($(length(dvs))) are of different lengths."))
     end
     return nothing
 end

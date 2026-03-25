@@ -1478,14 +1478,14 @@ function process_SciMLProblem(
         substitution_limit = 100, use_scc = true, time_dependent_init = is_time_dependent(sys),
         algebraic_only = false, missing_guess_value = default_missing_guess_value(),
         allow_incomplete = false, is_initializeprob = false, is_steadystateprob = false,
-        return_operating_point = false, kwargs...
+        return_operating_point = false, allow_array_eqs = false, kwargs...
     )
     dvs = unknowns(sys)
     ps = parameters(sys; initial_parameters = true)
     iv = has_iv(sys) ? get_iv(sys) : nothing
     eqs = equations(sys)
 
-    check_array_equations_unknowns(eqs, dvs)
+    check_array_equations_unknowns(eqs, dvs; allow_array_eqs)
 
     u0Type = pType = typeof(op)
 

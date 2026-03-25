@@ -49,6 +49,16 @@ function generate_rhs(
     ddvs = nothing
     extra_assignments = Assignment[]
 
+    # Flatten any ArrayOp equations into scalar equations for code generation.
+    # This is needed when using `complete()` instead of `mtkcompile()`, since
+    # `mtkcompile` flattens equations during structural simplification but
+    # `complete` preserves them. The flattening here is cheaper because it skips
+    # the structural simplification step.
+    has_array_eqs = any(eq -> Symbolics.isarraysymbolic(eq.lhs), eqs)
+    if has_array_eqs
+        eqs = flatten_equations(eqs)
+    end
+
     # used for DAEProblem and ImplicitDiscreteProblem
     if implicit_dae
         if override_discrete || is_discrete_system(sys)
