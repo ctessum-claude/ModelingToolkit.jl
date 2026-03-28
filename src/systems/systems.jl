@@ -28,6 +28,10 @@ function MTKBase.__mtkcompile(
         sort_eqs = true,
         kwargs...
     )
+    # Extract ArrayOp equations before TearingState flattens them.
+    # These are stored as metadata and used for vectorized code generation.
+    arrayop_infos = MTKBase.extract_arrayop_equations(equations(sys))
+
     sys, statemachines = extract_top_level_statemachines(sys)
     sys, source_info = expand_connections(sys, Val(true))
     state = TearingState(sys, source_info; sort_eqs)
@@ -46,9 +50,14 @@ function MTKBase.__mtkcompile(
         end
     end
     if isempty(brown_vars)
-        return mtkcompile!(
+        result = mtkcompile!(
             state; inputs, outputs, disturbance_inputs, kwargs...
         )
+        # Attach ArrayOp metadata to the compiled system
+        if !isempty(arrayop_infos)
+            result = SU.setmetadata(result, MTKBase.ArrayEquationsCtx, arrayop_infos)
+        end
+        return result
     else
         Is = Int[]
         Js = Int[]

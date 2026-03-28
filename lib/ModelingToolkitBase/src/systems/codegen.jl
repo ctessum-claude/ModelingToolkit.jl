@@ -112,6 +112,15 @@ function generate_rhs(
         sys, rhss, args...; p_start, extra_assignments,
         expression = Val{true}, expression_module = eval_module, kwargs...
     )
+
+    # Post-process IIP Expr to vectorize ArrayOp-covered equations
+    if !implicit_dae && !scalar
+        arrayop_metadata = SU.getmetadata(sys, ArrayEquationsCtx, nothing)
+        if arrayop_metadata !== nothing
+            res = vectorize_iip_expr(res, sys, arrayop_metadata, eqs)
+        end
+    end
+
     nargs = length(args) - length(p) + 1
     if is_dde(sys)
         p_start += 1

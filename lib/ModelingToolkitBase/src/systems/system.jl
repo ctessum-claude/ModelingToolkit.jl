@@ -1153,6 +1153,57 @@ of `StandardODEProblem`.
 struct ProblemTypeCtx end
 
 """
+Metadata key for systems containing original ArrayOp equations from PDE discretization.
+These are stored before `mtkcompile` flattens them, and used during code generation
+to produce vectorized loop code instead of N individual scalar assignments.
+"""
+struct ArrayEquationsCtx end
+
+"""
+Information about a single ArrayOp equation and how it maps to the compiled system's
+scalar equations and unknowns.
+"""
+struct ArrayEquationInfo
+    "The original ArrayOp equation (e.g., Dt(ArrayOp{u}) ~ ArrayOp{rhs})"
+    equation::Equation
+    "Number of scalar equations this ArrayOp represents"
+    scalar_count::Int
+    "Whether this is an ODE equation (has Dt on LHS)"
+    is_ode::Bool
+end
+
+"""
+    is_arrayop_equation(eq::Equation)
+
+Return `true` if the equation's LHS or RHS has array shape (i.e., is an ArrayOp equation).
+"""
+function is_arrayop_equation(eq::Equation)
+    return SU.is_array_shape(SU.shape(unwrap(eq.lhs))) ||
+           SU.is_array_shape(SU.shape(unwrap(eq.rhs)))
+end
+
+"""
+    extract_arrayop_equations(eqs::Vector{Equation})
+
+Identify ArrayOp equations in a list and return a vector of `ArrayEquationInfo`.
+The original equations are not modified.
+"""
+function extract_arrayop_equations(eqs::Vector{Equation})
+    infos = ArrayEquationInfo[]
+    for eq in eqs
+        is_arrayop_equation(eq) || continue
+        scalar_eqs = flatten_equation(eq)
+        is_ode = let lhs = unwrap(eq.lhs)
+            # Check if any scalar equation has a Differential LHS
+            !isempty(scalar_eqs) && iscall(unwrap(scalar_eqs[1].lhs)) &&
+                operation(unwrap(scalar_eqs[1].lhs)) isa Differential
+        end
+        push!(infos, ArrayEquationInfo(eq, length(scalar_eqs), is_ode))
+    end
+    return infos
+end
+
+"""
     $(TYPEDSIGNATURES)
 """
 function check_complete(sys::System, obj)
