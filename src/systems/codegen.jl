@@ -1,6 +1,10 @@
 function MTKBase.torn_system_jacobian_sparsity(sys::System)
     state = get_tearing_state(sys)
     state isa TearingState || return nothing
+    # If block equations were used, the tearing state's graph is compressed
+    # and doesn't match the expanded equation/unknown counts. Fall back to
+    # symbolic sparsity detection.
+    !isempty(state.block_eqs) && return nothing
     @unpack structure = state
     @unpack graph, var_to_diff = structure
 

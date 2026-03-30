@@ -46,9 +46,14 @@ function MTKBase.__mtkcompile(
         end
     end
     if isempty(brown_vars)
-        return mtkcompile!(
+        block_eqs = state.block_eqs
+        result = mtkcompile!(
             state; inputs, outputs, disturbance_inputs, kwargs...
         )
+        if !isempty(block_eqs)
+            result = _expand_arrayop_blocks(result, block_eqs)
+        end
+        return result
     else
         Is = Int[]
         Js = Int[]
@@ -201,3 +206,177 @@ end
 Mark whether an extra pass `p` can support compiling discrete systems.
 """
 discrete_compile_pass(p) = false
+
+"""
+    _expand_arrayop_blocks(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlockInfo})
+
+Post-process a compiled system to expand representative scalar equations back into
+all N scalar equations, and add the missing scalar unknowns.
+
+The speedup comes from structural analysis (tearing) operating on O(M) representative
+equations instead of O(N*M). This function expands back to N scalar equations for
+codegen compatibility. Future work can teach codegen to handle ArrayOp directly.
+"""
+function _expand_arrayop_blocks(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlockInfo})
+    compiled_eqs = equations(sys)
+    compiled_obs = observed(sys)
+    compiled_dvs = unknowns(sys)
+
+    new_eqs = Equation[]
+    new_obs = Equation[]
+    new_dvs = copy(compiled_dvs)
+    dvs_set = Set{SymbolicT}(unwrap.(new_dvs))
+
+    # Expand ODE equations
+    for eq in compiled_eqs
+        block = _find_matching_block(eq, block_eqs)
+        if block !== nothing
+            expanded = _expand_block_eq(eq, block)
+            append!(new_eqs, expanded)
+            _add_block_unknowns!(new_dvs, dvs_set, block)
+        else
+            push!(new_eqs, eq)
+        end
+    end
+
+    # Expand observed equations
+    for eq in compiled_obs
+        block = _find_matching_block_obs(eq, block_eqs)
+        if block !== nothing
+            expanded = _expand_block_eq(eq, block)
+            append!(new_obs, expanded)
+        else
+            push!(new_obs, eq)
+        end
+    end
+
+    @set! sys.eqs = new_eqs
+    @set! sys.observed = new_obs
+    @set! sys.unknowns = new_dvs
+    return MTKBase.invalidate_cache!(sys)
+end
+
+"""
+Find the ArrayBlockInfo matching a compiled equation by comparing LHS variables.
+"""
+function _find_matching_block(eq::Equation, block_eqs::Dict{Int, MTKTearing.ArrayBlockInfo})
+    eq_lhs = unwrap(eq.lhs)
+    for (_, block) in block_eqs
+        rep_lhs = unwrap(block.representative_eq.lhs)
+        if MTKBase.isdiffeq(eq) && MTKBase.isdiffeq(block.representative_eq)
+            if isequal(arguments(eq_lhs)[1], arguments(rep_lhs)[1])
+                return block
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+Find the ArrayBlockInfo matching an observed equation by comparing LHS variables.
+"""
+function _find_matching_block_obs(eq::Equation, block_eqs::Dict{Int, MTKTearing.ArrayBlockInfo})
+    eq_lhs = unwrap(eq.lhs)
+    SU._iszero(eq_lhs) && return nothing
+    for (_, block) in block_eqs
+        rep = block.representative_eq
+        rep_lhs = unwrap(rep.lhs)
+        if !MTKBase.isdiffeq(rep) && !SU._iszero(rep_lhs) && isequal(eq_lhs, rep_lhs)
+            return block
+        end
+    end
+    return nothing
+end
+
+"""
+Expand a representative scalar equation (from tearing) into all N scalar equations
+by shifting array indices. The compiled representative has all tearing substitutions
+applied; we replicate it for each element index.
+"""
+function _expand_block_eq(compiled_rep::Equation, block::MTKTearing.ArrayBlockInfo)
+    n = block.scalar_count
+
+    # Determine the base index used in the representative
+    rep_lhs = unwrap(compiled_rep.lhs)
+    rep_base_idx = _extract_first_index(rep_lhs)
+    rep_base_idx === nothing && return [compiled_rep]
+
+    # First element is the representative itself (shift=0)
+    result = Equation[compiled_rep]
+    # Remaining n-1 elements are shifted by +1, +2, ..., +(n-1)
+    for shift in 1:(n - 1)
+        new_lhs = _shift_all_array_indices(unwrap(compiled_rep.lhs), shift)
+        new_rhs = _shift_all_array_indices(unwrap(compiled_rep.rhs), shift)
+        push!(result, new_lhs ~ new_rhs)
+    end
+    return result
+end
+
+"""
+Extract the integer index from the first getindex in an expression.
+E.g., D(u(t)[3]) → 3, v(t)[1] → 1
+"""
+function _extract_first_index(expr::SymbolicT)
+    if iscall(expr)
+        f = operation(expr)
+        args = arguments(expr)
+        if f === getindex && length(args) >= 2
+            idx = args[2]
+            return SU.isconst(idx) ? Int(SU.unwrap_const(idx)) : nothing
+        end
+        for a in args
+            result = _extract_first_index(a)
+            result !== nothing && return result
+        end
+    end
+    return nothing
+end
+
+"""
+Shift all array getindex references in an expression by `shift`.
+E.g., _shift_all_array_indices(D(u[1]) + v[1]^2, 2) → D(u[3]) + v[3]^2
+"""
+function _shift_all_array_indices(expr::SymbolicT, shift::Int)
+    shift == 0 && return expr
+    if iscall(expr)
+        f = operation(expr)
+        args = arguments(expr)
+        if f === getindex && length(args) >= 2
+            new_idx = args[2] + shift
+            return args[1][new_idx]
+        elseif f isa Differential
+            new_inner = _shift_all_array_indices(args[1], shift)
+            return f(new_inner)
+        else
+            new_args = [_shift_all_array_indices(a, shift) for a in args]
+            return SU.maketerm(SymbolicT, f, new_args, SU.metadata(expr))
+        end
+    end
+    return expr
+end
+
+"""
+Add scalar unknowns for a block ODE variable. Extracts the base array from
+the representative and adds all its indexed elements.
+"""
+function _add_block_unknowns!(dvs::Vector, dvs_set::Set{SymbolicT}, block::MTKTearing.ArrayBlockInfo)
+    rep_eq = block.representative_eq
+    rep_lhs = unwrap(rep_eq.lhs)
+
+    if MTKBase.isdiffeq(rep_eq)
+        inner = arguments(rep_lhs)[1]  # u(t)[1]
+        if iscall(inner) && operation(inner) === getindex
+            base_arr = arguments(inner)[1]  # u(t)
+            base_sh = SU.shape(base_arr)
+            if SU.is_array_shape(base_sh)
+                for idx in Iterators.product(base_sh...)
+                    var = unwrap(base_arr[idx...])
+                    if !(var in dvs_set)
+                        push!(dvs, var)
+                        push!(dvs_set, var)
+                    end
+                end
+            end
+        end
+    end
+end

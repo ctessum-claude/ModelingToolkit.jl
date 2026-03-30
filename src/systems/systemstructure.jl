@@ -240,7 +240,7 @@ function _mtkcompile!(
     state = ModelingToolkit.inputs_to_parameters!(state, inputs, outputs)
     StateSelection.trivial_tearing!(state)
     sys, mm = ModelingToolkit.alias_elimination!(state; fully_determined, kwargs...)
-    if check_consistency
+    if check_consistency && isempty(state.block_eqs)
         fully_determined = StateSelection.check_consistency(
             state, orig_inputs; nothrow = fully_determined === nothing
         )
