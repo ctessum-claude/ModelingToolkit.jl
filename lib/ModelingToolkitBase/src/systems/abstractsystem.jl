@@ -3078,7 +3078,15 @@ function check_array_equations_unknowns(eqs, dvs)
     end
 end
 
-function check_eqs_u0(eqs, dvs, u0; check_length = true, kwargs...)
+function check_eqs_u0(eqs, dvs, u0; check_length = true, allow_block_eqs = false, kwargs...)
+    if allow_block_eqs
+        # Block systems have M representative equations but N unknowns.
+        # Only check that u0 matches unknowns, not equations.
+        if u0 !== nothing && length(dvs) != length(u0)
+            throw(ArgumentError("Unknowns ($(length(dvs))) and initial conditions ($(length(u0))) are of different lengths."))
+        end
+        return nothing
+    end
     if u0 !== nothing
         if check_length
             if !(length(eqs) == length(dvs) == length(u0))

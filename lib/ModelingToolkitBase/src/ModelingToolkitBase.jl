@@ -193,6 +193,7 @@ include("systems/analysis_points.jl")
 include("systems/codegen_utils.jl")
 include("problems/docs.jl")
 include("systems/codegen.jl")
+include("systems/vectorized_codegen.jl")
 include("systems/problem_utils.jl")
 
 include("problems/compatibility.jl")

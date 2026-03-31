@@ -108,6 +108,18 @@ function generate_rhs(
         p_start += 1
     end
 
+    # For block systems: expand equations to N scalars at code generation time,
+    # then generate code. This is O(N) in codegen but the symbolic expansion
+    # is fast (just index shifting, no symbolic manipulation).
+    block_eqs_meta = nothing
+    if !implicit_dae && !scalar
+        block_eqs_meta = getmetadata(sys, BlockEquationsKey, nothing)
+        if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
+            # Expand M representative rhss to N scalar rhss by index-shifting
+            rhss, eqs = _expand_rhss_for_codegen(rhss, eqs, sys, block_eqs_meta)
+        end
+    end
+
     res = build_function_wrapper(
         sys, rhss, args...; p_start, extra_assignments,
         expression = Val{true}, expression_module = eval_module, kwargs...
@@ -475,6 +487,18 @@ applied to the symbolic mass matrix. Returns a `Diagonal` or `LinearAlgebra.I` w
 possible.
 """
 function calculate_massmatrix(sys::System; simplify = false)
+    # For block systems, check if all equations are ODE (mass matrix = I)
+    block_eqs = getmetadata(sys, BlockEquationsKey, nothing)
+    if block_eqs !== nothing && !isempty(block_eqs)
+        # Check if all equations (scalar + block) are ODE
+        all_ode = all(equations(sys)) do eq
+            isdiffeq(eq)
+        end
+        if all_ode
+            return I  # All ODE → identity mass matrix
+        end
+    end
+
     eqs = [eq for eq in equations(sys)]
     M = zeros(length(eqs), length(eqs))
     for (i, eq) in enumerate(eqs)
@@ -528,6 +552,14 @@ Return the sparsity pattern of the jacobian of `sys` as a matrix.
 function jacobian_sparsity(sys::System)
     sparsity = torn_system_jacobian_sparsity(sys)
     sparsity === nothing || return sparsity
+
+    # For block systems, M equations ≠ N unknowns, so skip symbolic sparsity
+    # and let the solver use dense Jacobian or AD.
+    block_eqs = getmetadata(sys, BlockEquationsKey, nothing)
+    if block_eqs !== nothing && !isempty(block_eqs)
+        N = length(unknowns(sys))
+        return sparse(ones(Bool, N, N))  # Dense pattern
+    end
 
     return Symbolics.jacobian_sparsity(
         [eq.rhs for eq in full_equations(sys)],

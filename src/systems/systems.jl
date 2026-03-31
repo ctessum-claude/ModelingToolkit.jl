@@ -51,7 +51,7 @@ function MTKBase.__mtkcompile(
             state; inputs, outputs, disturbance_inputs, kwargs...
         )
         if !isempty(block_eqs)
-            result = _expand_arrayop_blocks(result, block_eqs)
+            result = _vectorize_system(result, block_eqs)
         end
         return result
     else
@@ -206,6 +206,53 @@ end
 Mark whether an extra pass `p` can support compiling discrete systems.
 """
 discrete_compile_pass(p) = false
+
+"""
+    _vectorize_system(sys, block_eqs)
+
+Prepare a block-teared system for vectorized codegen. Instead of expanding M representative
+equations to N scalar equations (O(N)), this function:
+1. Adds all N scalar unknowns (needed for IndexCache and u0 mapping)
+2. Stores block_eqs as metadata on the system (used by generate_rhs for loop codegen)
+3. Expands only observed block equations (needed for user access to observed variables)
+4. Keeps the M representative equations as the system's equation list
+
+This makes mtkcompile O(1) in grid size — the only O(N) work is adding unknowns to a list.
+"""
+function _vectorize_system(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlockInfo})
+    compiled_dvs = unknowns(sys)
+    new_dvs = copy(compiled_dvs)
+    dvs_set = Set{SymbolicT}(unwrap.(new_dvs))
+
+    # Add all N scalar unknowns for each ODE block
+    for (key, block) in block_eqs
+        key < 0 && continue  # Skip eliminated algebraics
+        MTKBase.isdiffeq(block.representative_eq) || continue
+        _add_block_unknowns!(new_dvs, dvs_set, block)
+    end
+
+    # Expand observed block equations (negative keys = pre-substituted algebraics)
+    new_obs = copy(observed(sys))
+    for (key, block) in block_eqs
+        key >= 0 && continue
+        rep = block.representative_eq
+        expanded = _expand_block_eq(rep, block)
+        append!(new_obs, expanded)
+    end
+
+    @set! sys.unknowns = new_dvs
+    @set! sys.observed = new_obs
+
+    # Store block_eqs metadata for codegen
+    sys = SU.setmetadata(sys, MTKBase.BlockEquationsKey, block_eqs)
+
+    return MTKBase.invalidate_cache!(sys)
+end
+
+"""Retrieve block_eqs metadata from a system, or nothing if not present."""
+function _get_block_eqs(sys::System)
+    SU.getmetadata(sys, MTKBase.BlockEquationsKey, nothing)
+end
 
 """
     _expand_arrayop_blocks(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlockInfo})

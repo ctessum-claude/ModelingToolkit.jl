@@ -1616,7 +1616,8 @@ function process_SciMLProblem(
         u0 = u0_constructor(u0)
     end
 
-    check_eqs_u0(eqs, dvs, u0; check_length, kwargs...)
+    _allow_block = getmetadata(sys, BlockEquationsKey, nothing) !== nothing
+    check_eqs_u0(eqs, dvs, u0; check_length, allow_block_eqs = _allow_block, kwargs...)
 
     if warn_cyclic_dependency
         cycles = check_substitution_cycles(
