@@ -239,7 +239,7 @@ function _expand_arrayop_blocks(sys::System, block_eqs::Dict{Int, MTKTearing.Arr
         end
     end
 
-    # Expand observed equations
+    # Expand observed equations from compiled system
     for eq in compiled_obs
         block = _find_matching_block_obs(eq, block_eqs)
         if block !== nothing
@@ -248,6 +248,16 @@ function _expand_arrayop_blocks(sys::System, block_eqs::Dict{Int, MTKTearing.Arr
         else
             push!(new_obs, eq)
         end
+    end
+
+    # Expand pre-substituted algebraic blocks as observed equations.
+    # These were eliminated during TearingState construction (stored with negative keys)
+    # and need to be added as observed equations for the solver.
+    for (key, block) in block_eqs
+        key >= 0 && continue  # Only process negative keys (eliminated algebraics)
+        rep = block.representative_eq
+        expanded = _expand_block_eq(rep, block)
+        append!(new_obs, expanded)
     end
 
     @set! sys.eqs = new_eqs
