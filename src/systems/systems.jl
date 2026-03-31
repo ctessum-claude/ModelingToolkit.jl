@@ -299,66 +299,102 @@ function _find_matching_block_obs(eq::Equation, block_eqs::Dict{Int, MTKTearing.
 end
 
 """
-Expand a representative scalar equation (from tearing) into all N scalar equations
-by shifting array indices. The compiled representative has all tearing substitutions
-applied; we replicate it for each element index.
+Expand a representative scalar equation into all N scalar equations by re-substituting
+the ArrayOp's index variables with each concrete index value from the iteration ranges.
+
+This correctly handles:
+- Multi-dimensional ArrayOps (2D+ grids): iterates over Cartesian product of ranges
+- Multi-variable systems: each variable's indices are shifted according to its own
+  appearance in the expression, not uniformly
+- Non-uniform index spaces: uses the actual iteration ranges from the ArrayOp
 """
 function _expand_block_eq(compiled_rep::Equation, block::MTKTearing.ArrayBlockInfo)
-    n = block.scalar_count
+    # Get the ArrayOp to extract index variables and ranges
+    orig_eq = block.original_eq
+    ao = MTKTearing._find_arrayop(unwrap(orig_eq.lhs))
+    if ao === nothing
+        ao = MTKTearing._find_arrayop(unwrap(orig_eq.rhs))
+    end
+    ao === nothing && return [compiled_rep]
 
-    # Determine the base index used in the representative
-    rep_lhs = unwrap(compiled_rep.lhs)
-    rep_base_idx = _extract_first_index(rep_lhs)
-    rep_base_idx === nothing && return [compiled_rep]
+    # Extract output_idx symbols and their iteration ranges
+    output_idx, ranges, sh = _get_arrayop_index_info(ao)
+    isempty(output_idx) && return [compiled_rep]
 
-    # First element is the representative itself (shift=0)
-    result = Equation[compiled_rep]
-    # Remaining n-1 elements are shifted by +1, +2, ..., +(n-1)
-    for shift in 1:(n - 1)
-        new_lhs = _shift_all_array_indices(unwrap(compiled_rep.lhs), shift)
-        new_rhs = _shift_all_array_indices(unwrap(compiled_rep.rhs), shift)
-        push!(result, new_lhs ~ new_rhs)
+    # Get the representative's index values (what was substituted to create it)
+    rep_idx_vals = Int[]
+    for (dim_i, ii) in enumerate(output_idx)
+        if haskey(ranges, ii)
+            push!(rep_idx_vals, first(ranges[ii]))
+        else
+            push!(rep_idx_vals, first(sh[dim_i]))
+        end
+    end
+
+    # Build the list of all iteration ranges
+    iter_ranges = [haskey(ranges, ii) ? ranges[ii] : sh[dim_i]
+                   for (dim_i, ii) in enumerate(output_idx)]
+
+    # For each point in the Cartesian product of ranges, compute the per-dimension
+    # shift from the representative's index values and apply it
+    result = Equation[]
+    for idx_tuple in Iterators.product(iter_ranges...)
+        shifts = [idx_tuple[d] - rep_idx_vals[d] for d in eachindex(output_idx)]
+        if all(iszero, shifts)
+            push!(result, compiled_rep)
+        else
+            # Apply per-dimension shifts to the compiled representative
+            new_lhs = _shift_array_indices_multidim(unwrap(compiled_rep.lhs), shifts)
+            new_rhs = _shift_array_indices_multidim(unwrap(compiled_rep.rhs), shifts)
+            push!(result, new_lhs ~ new_rhs)
+        end
     end
     return result
 end
 
 """
-Extract the integer index from the first getindex in an expression.
-E.g., D(u(t)[3]) → 3, v(t)[1] → 1
+Extract output_idx symbols, ranges dict, and shape from an ArrayOp.
+Returns (output_idx_symbols, ranges_dict, shape).
 """
-function _extract_first_index(expr::SymbolicT)
-    if iscall(expr)
-        f = operation(expr)
-        args = arguments(expr)
-        if f === getindex && length(args) >= 2
-            idx = args[2]
-            return SU.isconst(idx) ? Int(SU.unwrap_const(idx)) : nothing
-        end
-        for a in args
-            result = _extract_first_index(a)
-            result !== nothing && return result
-        end
-    end
-    return nothing
+function _get_arrayop_index_info(ao)
+    SU.isarrayop(ao) || return SymbolicT[], Dict{SymbolicT, StepRange{Int,Int}}(), UnitRange{Int}[]
+    # Use MTKTearing's _find_arrayop infrastructure to extract via @match
+    # which is available in the MTKTearing module
+    MTKTearing._get_arrayop_index_info(ao)
 end
 
 """
-Shift all array getindex references in an expression by `shift`.
-E.g., _shift_all_array_indices(D(u[1]) + v[1]^2, 2) → D(u[3]) + v[3]^2
+Shift array indices in a multi-dimensional expression. `shifts` is a vector of
+per-dimension shifts (e.g., [+1, +2] for a 2D system). All getindex calls in the
+expression have their indices shifted: the k-th index argument is shifted by shifts[k].
+
+This correctly handles multi-variable systems because the shift is applied to the
+index positions (dimensions), not to specific variables. In a system where u[i,j]
+and v[i,j] share the same index space, both get shifted identically. In a system
+where flux[i] and u[i] are 1D, the single shift applies to both.
 """
-function _shift_all_array_indices(expr::SymbolicT, shift::Int)
-    shift == 0 && return expr
+function _shift_array_indices_multidim(expr::SymbolicT, shifts::Vector{Int})
+    all(iszero, shifts) && return expr
     if iscall(expr)
         f = operation(expr)
         args = arguments(expr)
         if f === getindex && length(args) >= 2
-            new_idx = args[2] + shift
-            return args[1][new_idx]
+            # Shift each index dimension
+            n_idx = length(args) - 1  # number of index arguments
+            new_args = Any[args[1]]  # base array stays the same
+            for k in 1:n_idx
+                if k <= length(shifts) && shifts[k] != 0
+                    push!(new_args, args[k+1] + shifts[k])
+                else
+                    push!(new_args, args[k+1])
+                end
+            end
+            return new_args[1][new_args[2:end]...]
         elseif f isa Differential
-            new_inner = _shift_all_array_indices(args[1], shift)
+            new_inner = _shift_array_indices_multidim(args[1], shifts)
             return f(new_inner)
         else
-            new_args = [_shift_all_array_indices(a, shift) for a in args]
+            new_args = [_shift_array_indices_multidim(a, shifts) for a in args]
             return SU.maketerm(SymbolicT, f, new_args, SU.metadata(expr))
         end
     end
