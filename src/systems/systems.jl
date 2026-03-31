@@ -221,14 +221,50 @@ This makes mtkcompile O(1) in grid size — the only O(N) work is adding unknown
 """
 function _vectorize_system(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlockInfo})
     compiled_dvs = unknowns(sys)
-    new_dvs = copy(compiled_dvs)
-    dvs_set = Set{SymbolicT}(unwrap.(new_dvs))
 
-    # Add all N scalar unknowns for each ODE block
+    # Rebuild unknowns list, inserting all array elements contiguously at the
+    # representative's position. This ensures variable_index returns a contiguous
+    # range for each block, enabling du[loop_var + offset] in loop codegen.
+    new_dvs = SymbolicT[]
+    dvs_set = Set{SymbolicT}()
+
+    # Map from representative variable to its block
+    rep_var_to_block = Dict{SymbolicT, MTKTearing.ArrayBlockInfo}()
     for (key, block) in block_eqs
-        key < 0 && continue  # Skip eliminated algebraics
+        key < 0 && continue
         MTKBase.isdiffeq(block.representative_eq) || continue
-        _add_block_unknowns!(new_dvs, dvs_set, block)
+        rep_lhs = unwrap(block.representative_eq.lhs)
+        rep_var = arguments(rep_lhs)[1]  # u(t)[k] from D(u(t)[k])
+        rep_var_to_block[unwrap(rep_var)] = block
+    end
+
+    for dv in compiled_dvs
+        dv_uw = unwrap(dv)
+        if haskey(rep_var_to_block, dv_uw)
+            # This is a block representative — insert ALL array elements here
+            block = rep_var_to_block[dv_uw]
+            rep_lhs = unwrap(block.representative_eq.lhs)
+            inner = arguments(rep_lhs)[1]
+            if iscall(inner) && operation(inner) === getindex
+                base_arr = arguments(inner)[1]
+                base_sh = SU.shape(base_arr)
+                if SU.is_array_shape(base_sh)
+                    for idx in Iterators.product(base_sh...)
+                        var = unwrap(base_arr[idx...])
+                        if !(var in dvs_set)
+                            push!(new_dvs, var)
+                            push!(dvs_set, var)
+                        end
+                    end
+                    continue  # Don't add the representative again
+                end
+            end
+        end
+        # Regular scalar unknown (or fallback)
+        if !(dv_uw in dvs_set)
+            push!(new_dvs, dv_uw)
+            push!(dvs_set, dv_uw)
+        end
     end
 
     # Expand observed block equations (negative keys = pre-substituted algebraics)

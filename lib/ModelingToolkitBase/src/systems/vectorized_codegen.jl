@@ -374,3 +374,247 @@ function _parameterize_indices(expr, base_idx::Int, loop_var::Symbol)
     end
     return expr
 end
+
+# ============================================================================
+# Loop-based code generation (ForLoop IR)
+# ============================================================================
+
+using SymbolicUtils.Code: ForLoop, SetArray, AtIndex, Let, Func, Assignment, LiteralExpr
+
+"""
+    _make_block_loop_wrap_code(block_eqs, sys)
+
+Create a wrap_code IIP transform that replaces block equation `AtIndex` entries
+in the `SetArray` with `ForLoop` IR objects. This reduces the generated code size
+from O(N) to O(M), dramatically cutting Julia JIT compilation time.
+
+Applied via `wrap_code` kwarg in `build_function_wrapper`, operating on the `Func`
+IR after `wrap_assignments` has wrapped the body in `Let(assignments, SetArray, false)`.
+"""
+function _make_block_loop_wrap_code(block_eqs, sys)
+    # Compute du position ranges for each block
+    block_du_ranges = Dict{Int, UnitRange{Int}}()
+    for (key, block) in block_eqs
+        key < 0 && continue
+        isdiffeq(block.representative_eq) || continue
+        rep_lhs = unwrap(block.representative_eq.lhs)
+        rep_var = arguments(rep_lhs)[1]
+        rep_pos = variable_index(sys, rep_var)
+        rep_pos === nothing && continue
+        block_du_ranges[key] = rep_pos:(rep_pos + block.scalar_count - 1)
+    end
+
+    function iip_transform(func::Func)
+        isempty(block_du_ranges) && return func
+
+        # Find the SetArray inside potentially nested Lets
+        let_body, set_array = _find_let_with_setarray(func.body)
+        (let_body === nothing || set_array === nothing) && return func
+
+        arr_sym = set_array.arr
+
+        # Collect all block du indices
+        block_indices = Set{Int}()
+        for (_, range) in block_du_ranges
+            union!(block_indices, range)
+        end
+
+        # Separate scalar and block AtIndex entries
+        scalar_entries = []
+        for entry in set_array.elems
+            if entry isa AtIndex && entry.i isa Integer && entry.i in block_indices
+                # Skip — will be replaced by ForLoop
+            else
+                push!(scalar_entries, entry)
+            end
+        end
+
+        # Build ForLoops for each block
+        forloops = ForLoop[]
+        for (key, du_range) in block_du_ranges
+            block = block_eqs[key]
+            rep_pos = first(du_range)
+
+            # Find the representative's AtIndex entry
+            rep_rhs = nothing
+            for entry in set_array.elems
+                if entry isa AtIndex && entry.i isa Integer && entry.i == rep_pos
+                    rep_rhs = entry.elem
+                    break
+                end
+            end
+            rep_rhs === nothing && continue
+
+            # At this IR stage, AtIndex.elem is SYMBOLIC.
+            # Convert to Expr via toexpr, inline observed, then parameterize at Expr level.
+            # This avoids symbolic type issues with loop variable indexing.
+            loop_var = Symbol("##blk_$(key)##")
+
+            # Build a NameState for toexpr (reuse the one from the outer function)
+            st = _SU_VC.Code.NameState()
+            rep_rhs_expr = _SU_VC.Code.toexpr(rep_rhs, st)
+
+            # Inline observed from Let assignments (at Expr level)
+            rep_rhs_expr = _inline_from_let_assignments(rep_rhs_expr, let_body.pairs, st)
+
+            # Parameterize Expr indices
+            param_rhs = _parameterize_ir_indices(rep_rhs_expr, rep_pos, loop_var)
+
+            # Build: for loop_var in du_range; arr[loop_var] = param_rhs; end
+            # param_rhs is a Julia Expr, wrap it in LiteralExpr for the IR
+            literal_rhs = _SU_VC.Code.LiteralExpr(param_rhs)
+            inner = SetArray(true, arr_sym, [AtIndex(loop_var, literal_rhs)], false)
+            push!(forloops, ForLoop(loop_var, du_range, inner))
+        end
+
+        # Rebuild body: scalar SetArray + ForLoops + return arr
+        new_set = SetArray(set_array.inbounds, arr_sym, scalar_entries, false)
+        inner_stmts = Union{Assignment, Any}[Assignment(gensym("scalar"), new_set)]
+        for (fi, fl) in enumerate(forloops)
+            push!(inner_stmts, Assignment(gensym("loop_$fi"), fl))
+        end
+        new_inner = Let(inner_stmts, arr_sym, false)
+
+        # Replace the SetArray in the Let chain
+        new_body = _replace_setarray_body(func.body, let_body, new_inner)
+        return Func(func.args, func.kwargs, new_body, func.pre)
+    end
+
+    return iip_transform
+end
+
+"""Find the Let containing a SetArray as its body."""
+function _find_let_with_setarray(body)
+    body isa Let || return (nothing, nothing)
+    if body.body isa SetArray
+        return (body, body.body)
+    elseif body.body isa Let
+        return _find_let_with_setarray(body.body)
+    end
+    return (nothing, nothing)
+end
+
+"""Replace the SetArray body in a Let chain with a new body."""
+function _replace_setarray_body(outer, target_let, replacement)
+    outer isa Let || return replacement
+    if outer === target_let
+        return Let(outer.pairs, replacement, outer.let_block)
+    elseif outer.body isa Let
+        new_inner = _replace_setarray_body(outer.body, target_let, replacement)
+        return Let(outer.pairs, new_inner, outer.let_block)
+    end
+    return Let(outer.pairs, replacement, outer.let_block)
+end
+
+"""
+Inline observed variable definitions into a symbolic RHS expression.
+Uses Symbolics.fixpoint_sub with the observed equation dict built from Let pairs.
+"""
+function _inline_observed_symbolic(expr, pairs)
+    sub_dict = Dict{SymbolicT, Any}()
+    for p in pairs
+        p isa Assignment || continue
+        p.lhs isa SymbolicT || continue
+        p.rhs isa SymbolicT || continue
+        sub_dict[p.lhs] = p.rhs
+    end
+    isempty(sub_dict) && return expr
+    # Use fixpoint_sub to recursively inline
+    return Symbolics.fixpoint_sub(expr, sub_dict)
+end
+
+"""
+Parameterize array indices in a symbolic expression for loop codegen.
+Uses Symbolics.substitute to replace all concrete-indexed array references
+with loop-variable-indexed references.
+
+E.g., for rep_pos=3 and loop_var=:k:
+  u(t)[3] → u(t)[k], u(t)[2] → u(t)[k-1], u(t)[4] → u(t)[k+1]
+"""
+function _parameterize_symbolic_indices(expr, rep_pos::Int, loop_var_sym)
+    expr isa SymbolicT || return expr
+    # Build substitution dict: find all getindex(arr, concrete_int) in expr
+    # and map them to getindex(arr, loop_var + offset)
+    sub_dict = Dict{SymbolicT, Any}()
+    _collect_getindex_subs!(sub_dict, expr, rep_pos, loop_var_sym)
+    isempty(sub_dict) && return expr
+    # Use the allow-all Substituter to penetrate into Differential
+    allow_all = (_) -> true
+    sub = _SU_VC.Substituter{false}(sub_dict, allow_all)
+    return sub(expr)
+end
+
+"""Collect all getindex(arr, concrete_int) → getindex(arr, loop_var + offset) substitutions."""
+function _collect_getindex_subs!(sub_dict, expr, rep_pos, loop_var_sym)
+    expr isa SymbolicT || return
+    _SU_VC.iscall(expr) || return
+    f = operation(expr)
+    args = arguments(expr)
+    if f === getindex && length(args) >= 2
+        idx = args[2]
+        if _SU_VC.isconst(idx)
+            val = Int(_SU_VC.unwrap_const(idx))
+            offset = val - rep_pos
+            new_idx = offset == 0 ? loop_var_sym : loop_var_sym + offset
+            sub_dict[expr] = args[1][new_idx]
+        end
+    end
+    # Recurse into arguments
+    for a in args
+        _collect_getindex_subs!(sub_dict, a, rep_pos, loop_var_sym)
+    end
+end
+
+"""Inline observed variable definitions from Let assignments into an Expr."""
+function _inline_from_let_assignments(expr::Expr, pairs, st)
+    sub_dict = Dict{Any, Any}()
+    for p in pairs
+        p isa Assignment || continue
+        p.lhs === nothing && continue
+        # Convert both LHS and RHS to Expr form for matching
+        lhs_expr = p.lhs isa SymbolicT ? _SU_VC.Code.toexpr(p.lhs, st) : p.lhs
+        rhs_expr = p.rhs isa SymbolicT ? _SU_VC.Code.toexpr(p.rhs, st) : p.rhs
+        lhs_expr isa Symbol || continue  # Only inline simple variable assignments
+        sub_dict[lhs_expr] = rhs_expr
+    end
+    isempty(sub_dict) && return expr
+    for _ in 1:20
+        new_expr = _substitute_in_ir(expr, sub_dict)
+        new_expr === expr && break
+        expr = new_expr
+    end
+    return expr
+end
+
+"""Substitute symbols in an IR expression (Expr tree) using a dictionary."""
+function _substitute_in_ir(expr, sub_dict)
+    haskey(sub_dict, expr) && return sub_dict[expr]
+    if expr isa Expr
+        return Expr(expr.head, Any[_substitute_in_ir(a, sub_dict) for a in expr.args]...)
+    end
+    return expr
+end
+
+"""Parameterize integer array indices in an Expr with a loop variable."""
+function _parameterize_ir_indices(expr, base_idx::Int, loop_var::Symbol)
+    if expr isa Expr
+        if expr.head === :ref && length(expr.args) >= 2
+            new_args = Any[expr.args[1]]
+            for k in 2:length(expr.args)
+                idx = expr.args[k]
+                if idx isa Integer
+                    offset = Int(idx) - base_idx
+                    push!(new_args, offset == 0 ? loop_var :
+                        Expr(:call, :+, loop_var, offset))
+                else
+                    push!(new_args, _parameterize_ir_indices(idx, base_idx, loop_var))
+                end
+            end
+            return Expr(:ref, new_args...)
+        else
+            return Expr(expr.head,
+                Any[_parameterize_ir_indices(a, base_idx, loop_var) for a in expr.args]...)
+        end
+    end
+    return expr
+end

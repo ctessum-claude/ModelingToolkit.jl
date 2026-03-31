@@ -109,21 +109,36 @@ function generate_rhs(
     end
 
     # For block systems: expand equations to N scalars at code generation time,
-    # then generate code. This is O(N) in codegen but the symbolic expansion
-    # is fast (just index shifting, no symbolic manipulation).
+    # then use wrap_code to replace block assignments with ForLoops in the IIP function.
     block_eqs_meta = nothing
+    block_wrap_code = nothing
     if !implicit_dae && !scalar
         block_eqs_meta = getmetadata(sys, BlockEquationsKey, nothing)
         if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
-            # Expand M representative rhss to N scalar rhss by index-shifting
+            # Expand M representative rhss to N scalar rhss
             rhss, eqs = _expand_rhss_for_codegen(rhss, eqs, sys, block_eqs_meta)
+            # Create wrap_code that replaces block AtIndex entries with ForLoops
+            block_wrap_code = _make_block_loop_wrap_code(block_eqs_meta, sys)
         end
     end
 
+    # For block systems: disable CSE (ForLoop bodies need raw expressions)
+    # and post-process the final Expr to add for-loops
+    block_cse_override = block_eqs_meta !== nothing && !isempty(block_eqs_meta) ? false : nothing
+
     res = build_function_wrapper(
         sys, rhss, args...; p_start, extra_assignments,
-        expression = Val{true}, expression_module = eval_module, kwargs...
+        expression = Val{true}, expression_module = eval_module,
+        cse = something(block_cse_override, get(kwargs, :cse, true)),
+        kwargs...
     )
+
+    # Post-process IIP Expr to replace block scalar assignments with for-loops
+    if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
+        oop_expr, iip_expr = res
+        vectorize_iip_expr!(iip_expr, sys, block_eqs_meta)
+        res = (oop_expr, iip_expr)
+    end
     nargs = length(args) - length(p) + 1
     if is_dde(sys)
         p_start += 1
