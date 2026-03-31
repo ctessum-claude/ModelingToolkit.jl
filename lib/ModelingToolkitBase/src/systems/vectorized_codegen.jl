@@ -41,6 +41,68 @@ function _get_arrayop_index_info_local(ao)
 end
 
 """
+    _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
+
+Inline observed variable definitions into block representative RHSs so they become
+self-contained (no observed variable references). This is critical for loop codegen:
+the loop body must not reference N separate observed variable locals.
+
+Only block representative RHSs are modified. Scalar equation RHSs are unchanged
+(their observed deps are handled normally by build_function_wrapper).
+"""
+function _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
+    obs = observed(sys)
+    isempty(obs) && return rhss
+
+    # Build observed substitution dict
+    obs_dict = Dict{SymbolicT, Any}()
+    for eq in obs
+        lhs_uw = unwrap(eq.lhs)
+        obs_dict[lhs_uw] = unwrap(eq.rhs)
+    end
+    isempty(obs_dict) && return rhss
+
+    new_rhss = collect(rhss)
+    for (i, rhs) in enumerate(rhss)
+        block = get(block_eqs_meta, i, nothing)
+        block === nothing && continue
+        isdiffeq(block.representative_eq) || continue
+        # Inline all observed into this block representative RHS
+        new_rhss[i] = Symbolics.fixpoint_sub(unwrap(rhs), obs_dict; maxiters=100)
+    end
+    return new_rhss
+end
+
+"""
+    _build_block_outputidxs(eqs, sys)
+
+Build outputidxs vector mapping each equation to its du[] position.
+For block representatives: variable_index of the LHS derivative variable.
+For scalar equations: variable_index of the LHS derivative variable.
+"""
+function _build_block_outputidxs(eqs, sys)
+    outputidxs = Int[]
+    for eq in eqs
+        lhs = unwrap(eq.lhs)
+        if isdiffeq(eq)
+            # D(u(t)[k]) → variable_index(sys, u(t)[k])
+            inner = arguments(lhs)[1]
+            pos = variable_index(sys, inner)
+            push!(outputidxs, pos)
+        elseif _iszero(lhs)
+            # Algebraic equation 0 ~ rhs — shouldn't appear in block systems
+            # but handle gracefully
+            push!(outputidxs, length(outputidxs) + 1)
+        else
+            # v(t)[k] ~ rhs — variable_index of v(t)[k]
+            pos = variable_index(sys, lhs)
+            push!(outputidxs, pos)
+        end
+    end
+    return outputidxs
+end
+
+"""
     _expand_rhss_for_codegen(rhss, eqs, sys, block_eqs)
 
 Expand M representative RHS expressions to N scalar RHS expressions for code generation.
@@ -213,29 +275,33 @@ function vectorize_iip_expr!(iip_expr::Expr, sys, block_eqs::Dict{Int, <:Any})
 end
 
 """
-Find the block of assignments in an IIP function Expr.
-Returns the `args` vector of the `begin...end` block that contains the assignments.
+Find the block of `ˍ₋out[k] = rhs` assignments in an IIP function Expr.
+Returns the `args` vector of the innermost `@inbounds begin...end` block
+that contains `ˍ₋out` assignments.
 """
 function _find_assignment_block(expr::Expr)
     if expr.head === :function || expr.head === :(->)
         return _find_assignment_block(expr.args[2])
     elseif expr.head === :block
+        # Recurse into sub-blocks, looking for the innermost @inbounds with ˍ₋out assignments
         for arg in expr.args
             arg isa Expr || continue
             result = _find_assignment_block(arg)
             result !== nothing && return result
         end
-        # Check if this block contains assignments
-        for arg in expr.args
-            arg isa Expr || continue
-            if arg.head === :(=) || (arg.head === :macrocall && arg.args[1] === Symbol("@inbounds"))
-                return expr.args
-            end
-        end
     elseif expr.head === :macrocall && expr.args[1] === Symbol("@inbounds")
         inner = expr.args[end]
         if inner isa Expr && inner.head === :block
-            return inner.args
+            # Check if this @inbounds block has ˍ₋out assignments
+            for arg in inner.args
+                arg isa Expr || continue
+                if arg.head === :(=) && arg.args[1] isa Expr &&
+                   arg.args[1].head === :ref && arg.args[1].args[1] === :ˍ₋out
+                    return inner.args
+                end
+            end
+            # If not, recurse
+            return _find_assignment_block(inner)
         end
     end
     return nothing

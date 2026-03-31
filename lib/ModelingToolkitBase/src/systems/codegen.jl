@@ -108,32 +108,36 @@ function generate_rhs(
         p_start += 1
     end
 
-    # For block systems: expand equations to N scalars at code generation time,
-    # then use wrap_code to replace block assignments with ForLoops in the IIP function.
+    # For block systems: pass M equations directly with outputidxs mapping each
+    # equation to its du position. No O(N) expansion — only M AtIndex entries.
+    # Post-process the IIP Expr to replace block assignments with for-loops.
     block_eqs_meta = nothing
-    block_wrap_code = nothing
     if !implicit_dae && !scalar
         block_eqs_meta = getmetadata(sys, BlockEquationsKey, nothing)
         if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
-            # Expand M representative rhss to N scalar rhss
-            rhss, eqs = _expand_rhss_for_codegen(rhss, eqs, sys, block_eqs_meta)
-            # Create wrap_code that replaces block AtIndex entries with ForLoops
-            block_wrap_code = _make_block_loop_wrap_code(block_eqs_meta, sys)
+            # Step 1: Inline observed into block representative RHSs so they are
+            # self-contained (no observed variable references in the loop body)
+            rhss = _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
+
+            # Step 2: Build outputidxs mapping each equation to its du[] position
+            outputidxs = _build_block_outputidxs(eqs, sys)
         end
     end
 
-    # For block systems: disable CSE (ForLoop bodies need raw expressions)
-    # and post-process the final Expr to add for-loops
-    block_cse_override = block_eqs_meta !== nothing && !isempty(block_eqs_meta) ? false : nothing
+    # Pass outputidxs and disable CSE for block systems
+    block_kwargs = if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
+        (; outputidxs, cse = false, skipzeros = false, fillzeros = false)
+    else
+        (;)
+    end
 
     res = build_function_wrapper(
         sys, rhss, args...; p_start, extra_assignments,
         expression = Val{true}, expression_module = eval_module,
-        cse = something(block_cse_override, get(kwargs, :cse, true)),
-        kwargs...
+        block_kwargs..., kwargs...
     )
 
-    # Post-process IIP Expr to replace block scalar assignments with for-loops
+    # Post-process IIP Expr to replace block representative assignments with for-loops
     if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
         oop_expr, iip_expr = res
         vectorize_iip_expr!(iip_expr, sys, block_eqs_meta)
