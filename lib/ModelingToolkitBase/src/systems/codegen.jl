@@ -116,22 +116,12 @@ function generate_rhs(
     if !implicit_dae && !scalar
         block_eqs_meta = getmetadata(sys, BlockEquationsKey, nothing)
         if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
-            # Check if any block has multiple dimensions
-            has_multidim = _has_multidim_blocks(block_eqs_meta)
-
-            if has_multidim
-                # 2D+ blocks: expand M representatives to N scalar rhss at codegen time.
-                # This is O(N) but correctly handles all dimensions and stencil patterns.
-                # The O(1) tearing benefit still applies — only codegen is O(N).
-                rhss, eqs = _expand_rhss_for_codegen(rhss, eqs, sys, block_eqs_meta)
-            else
-                # 1D blocks: ForLoop IR (O(M) codegen)
-                rhss = _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
-                outputidxs = _build_block_outputidxs(eqs, sys)
-                iip_transform = _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
-                block_kwargs = (; outputidxs, skipzeros = false, fillzeros = false,
-                                  wrap_code = (identity, iip_transform))
-            end
+            # ForLoop IR for all blocks (1D and 2D+)
+            rhss = _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
+            outputidxs = _build_block_outputidxs(eqs, sys)
+            iip_transform = _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
+            block_kwargs = (; outputidxs, skipzeros = false, fillzeros = false,
+                              wrap_code = (identity, iip_transform))
         end
     end
 

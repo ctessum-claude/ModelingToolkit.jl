@@ -304,34 +304,53 @@ producing O(M) code instead of O(N).
 Returns a function `iip_transform(func::Func) -> Func`.
 """
 function _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
-    # Pre-compute block metadata
-    block_info_list = []  # (eq_idx, du_range, base_idx, du_offset)
+    # Pre-compute block metadata for both 1D and multi-dimensional blocks
+    block_info_list = []
     for (eq_idx, block) in block_eqs_meta
         eq_idx < 0 && continue
         isdiffeq(block.representative_eq) || continue
         rep_lhs = unwrap(block.representative_eq.lhs)
-        rep_var = arguments(rep_lhs)[1]  # u(t)[k]
+        rep_var = arguments(rep_lhs)[1]  # u(t)[k] or u(t)[i,j]
         rep_pos = variable_index(sys, rep_var)
         rep_pos === nothing && continue
 
-        # Get the concrete array index from the representative variable
-        base_idx = rep_pos  # default: du position = array index
+        # Get the ArrayOp's iteration info for this block
+        ao = _find_arrayop_local(unwrap(block.original_eq.lhs))
+        ao === nothing && (ao = _find_arrayop_local(unwrap(block.original_eq.rhs)))
+        ao === nothing && continue
+        output_idx, ranges, sh = _get_arrayop_index_info_local(ao)
+        isempty(output_idx) && continue
+
+        # Get per-dimension iteration ranges
+        iter_ranges = [haskey(ranges, ii) ? ranges[ii] : sh[dim_i]
+                       for (dim_i, ii) in enumerate(output_idx)]
+
+        # Get per-dimension base indices from the representative variable
+        base_idxs = Int[]
         if _SU_VC.iscall(rep_var) && operation(rep_var) === getindex
-            idx_arg = arguments(rep_var)[2]
-            if _SU_VC.isconst(idx_arg)
-                base_idx = Int(_SU_VC.unwrap_const(idx_arg))
+            rep_args = arguments(rep_var)
+            for k in 2:length(rep_args)
+                idx_arg = rep_args[k]
+                if _SU_VC.isconst(idx_arg)
+                    push!(base_idxs, Int(_SU_VC.unwrap_const(idx_arg)))
+                else
+                    push!(base_idxs, k <= length(iter_ranges) ? first(iter_ranges[k-1]) : 1)
+                end
             end
+        else
+            base_idxs = [rep_pos]
         end
 
         du_range = rep_pos:(rep_pos + block.scalar_count - 1)
-        du_offset = rep_pos - base_idx
-        push!(block_info_list, (eq_idx=eq_idx, du_range=du_range, base_idx=base_idx, du_offset=du_offset))
+        ndims = length(output_idx)
+
+        push!(block_info_list, (eq_idx=eq_idx, du_range=du_range, rep_pos=rep_pos,
+            base_idxs=base_idxs, iter_ranges=iter_ranges, ndims=ndims))
     end
 
     function iip_transform(func::Func)
         isempty(block_info_list) && return func
 
-        # Find the Let containing the SetArray
         let_body, set_array = _find_let_with_setarray(func.body)
         (let_body === nothing || set_array === nothing) && return func
 
@@ -345,7 +364,7 @@ function _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
 
         # Separate scalar and block AtIndex entries
         scalar_entries = AtIndex[]
-        rep_rhs_map = Dict{Int, Any}()  # rep_du_pos => symbolic RHS
+        rep_rhs_map = Dict{Int, Any}()
         for entry in set_array.elems
             entry isa AtIndex || continue
             if entry.i isa Integer && entry.i in block_du_positions
@@ -358,23 +377,41 @@ function _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
         # Build ForLoops for each block
         forloops = []
         for bi in block_info_list
-            rep_pos = first(bi.du_range)
-            rep_rhs = get(rep_rhs_map, rep_pos, nothing)
+            rep_rhs = get(rep_rhs_map, bi.rep_pos, nothing)
             rep_rhs === nothing && continue
 
-            # Create symbolic loop variable (needs type=Int for integer index)
-            loop_var = _SU_VC.Sym{_SU_VC.SymReal}(Symbol("__blk_k_$(bi.eq_idx)");
-                type = Int, shape = _SU_VC.ShapeVecT())
+            if bi.ndims == 1
+                # 1D block: single ForLoop
+                loop_var = _SU_VC.Sym{_SU_VC.SymReal}(Symbol("__blk_k_$(bi.eq_idx)");
+                    type = Int, shape = _SU_VC.ShapeVecT())
+                param_rhs = _parameterize_symbolic_rhs(rep_rhs, bi.base_idxs[1], loop_var)
+                du_offset = bi.rep_pos - bi.base_idxs[1]
+                du_idx = du_offset == 0 ? loop_var : loop_var + du_offset
+                inner = SetArray(true, arr_sym, [AtIndex(du_idx, param_rhs)], false)
+                push!(forloops, ForLoop(loop_var, bi.du_range, inner))
+            else
+                # Multi-dimensional block: nested ForLoops
+                # Create per-dimension loop variables
+                loop_vars = [_SU_VC.Sym{_SU_VC.SymReal}(
+                    Symbol("__blk_$(d)_$(bi.eq_idx)"); type = Int, shape = _SU_VC.ShapeVecT())
+                    for d in 1:bi.ndims]
 
-            # Parameterize: replace concrete getindex(arr, int) with arr[loop_var + offset]
-            param_rhs = _parameterize_symbolic_rhs(rep_rhs, bi.base_idx, loop_var)
+                # Parameterize RHS with multi-dimensional loop variables
+                param_rhs = _parameterize_symbolic_rhs_multidim(rep_rhs, bi.base_idxs, loop_vars)
 
-            # Compute du index expression
-            du_idx = bi.du_offset == 0 ? loop_var : loop_var + bi.du_offset
+                # Compute linear du index from multi-dimensional loop variables
+                # Unknowns are in column-major order from Iterators.product(shape...)
+                # Linear index = rep_pos + (i - base_i) + stride_1 * (j - base_j) + ...
+                strides = _compute_strides(bi.iter_ranges)
+                du_idx_expr = _build_linear_index_expr(loop_vars, bi.base_idxs, strides, bi.rep_pos)
 
-            # Build ForLoop IR
-            inner_set = SetArray(true, arr_sym, [AtIndex(du_idx, param_rhs)], false)
-            push!(forloops, ForLoop(loop_var, bi.du_range, inner_set))
+                # Build nested ForLoops via foldl (innermost first)
+                inner = SetArray(true, arr_sym, [AtIndex(du_idx_expr, param_rhs)], false)
+                loop = foldl(reverse(collect(enumerate(zip(loop_vars, bi.iter_ranges)))); init=inner) do body, (d, (lv, rng))
+                    ForLoop(lv, rng, body)
+                end
+                push!(forloops, loop)
+            end
         end
 
         # Rebuild body: scalar SetArray + ForLoops, return arr
@@ -385,12 +422,35 @@ function _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
         end
         new_inner = Let(inner_pairs, arr_sym, false)
 
-        # Replace SetArray in the Let chain
         new_body = _replace_setarray_body(func.body, let_body, new_inner)
         return Func(func.args, func.kwargs, new_body, func.pre)
     end
 
     return iip_transform
+end
+
+"""Compute strides for column-major indexing from ranges."""
+function _compute_strides(iter_ranges)
+    strides = Int[1]
+    for i in 1:(length(iter_ranges)-1)
+        push!(strides, strides[end] * length(iter_ranges[i]))
+    end
+    return strides
+end
+
+"""Build a symbolic linear index expression from multi-dim loop variables."""
+function _build_linear_index_expr(loop_vars, base_idxs, strides, rep_pos)
+    # linear = rep_pos + sum((loop_var_d - base_idx_d) * stride_d for d in dims)
+    expr = rep_pos
+    for d in eachindex(loop_vars)
+        offset_d = loop_vars[d] - base_idxs[d]
+        if strides[d] == 1
+            expr = expr + offset_d
+        else
+            expr = expr + offset_d * strides[d]
+        end
+    end
+    return expr
 end
 
 """
@@ -441,6 +501,57 @@ function _collect_symbolic_getindex_subs!(sub_dict, expr, base_idx, loop_var)
     end
     for a in args
         _collect_symbolic_getindex_subs!(sub_dict, a, base_idx, loop_var)
+    end
+end
+
+"""
+    _parameterize_symbolic_rhs_multidim(expr, base_idxs, loop_vars)
+
+Multi-dimensional version of _parameterize_symbolic_rhs. Replaces all concrete-integer
+`getindex(arr, Const(i1), Const(i2), ...)` with `getindex(arr, lv1+off1, lv2+off2, ...)`.
+"""
+function _parameterize_symbolic_rhs_multidim(expr, base_idxs::Vector{Int}, loop_vars)
+    sub_dict = Dict{SymbolicT, Any}()
+    _collect_symbolic_getindex_subs_multidim!(sub_dict, expr, base_idxs, loop_vars)
+    isempty(sub_dict) && return expr
+    allow_all = (_) -> true
+    sub = _SU_VC.Substituter{false}(sub_dict, allow_all)
+    return sub(expr)
+end
+
+"""
+Collect multi-dimensional getindex substitution rules.
+For getindex(arr, Const(i1), Const(i2), ...), builds a replacement with
+loop variables: getindex(arr, lv1 + (i1-base1), lv2 + (i2-base2), ...).
+"""
+function _collect_symbolic_getindex_subs_multidim!(sub_dict, expr, base_idxs, loop_vars)
+    expr isa SymbolicT || return
+    _SU_VC.iscall(expr) || return
+    f = operation(expr)
+    args = arguments(expr)
+    if f === getindex && length(args) >= 2
+        n_idx = length(args) - 1
+        # Check if all indices are concrete integers
+        all_const = all(2:length(args)) do k
+            _SU_VC.isconst(args[k])
+        end
+        if all_const && n_idx == length(base_idxs) && n_idx == length(loop_vars)
+            new_idx_args = Any[]
+            for d in 1:n_idx
+                val = Int(_SU_VC.unwrap_const(args[d+1]))
+                offset = val - base_idxs[d]
+                new_idx = offset == 0 ? loop_vars[d] : loop_vars[d] + offset
+                push!(new_idx_args, new_idx)
+            end
+            expr_type = _SU_VC.symtype(expr)
+            replacement = _SU_VC.term(getindex, args[1], new_idx_args...;
+                type = expr_type, shape = _SU_VC.ShapeVecT())
+            sub_dict[expr] = replacement
+            return  # Don't recurse into matched getindex
+        end
+    end
+    for a in args
+        _collect_symbolic_getindex_subs_multidim!(sub_dict, a, base_idxs, loop_vars)
     end
 end
 
