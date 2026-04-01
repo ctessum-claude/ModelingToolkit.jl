@@ -108,25 +108,25 @@ function generate_rhs(
         p_start += 1
     end
 
-    # For block systems: pass M equations directly with outputidxs mapping each
-    # equation to its du position. No O(N) expansion — only M AtIndex entries.
-    # Post-process the IIP Expr to replace block assignments with for-loops.
+    # For block systems: pass M equations with outputidxs + wrap_code that
+    # generates ForLoop IR objects for block equations. This produces O(M) code
+    # instead of O(N), with CSE correctly scoping loop bodies.
     block_eqs_meta = nothing
     if !implicit_dae && !scalar
         block_eqs_meta = getmetadata(sys, BlockEquationsKey, nothing)
         if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
-            # Step 1: Inline observed into block representative RHSs so they are
-            # self-contained (no observed variable references in the loop body)
+            # Inline observed into block representative RHSs (makes them self-contained)
             rhss = _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
-
-            # Step 2: Build outputidxs mapping each equation to its du[] position
+            # Build outputidxs mapping each equation to its du[] position
             outputidxs = _build_block_outputidxs(eqs, sys)
         end
     end
 
-    # Pass outputidxs and disable CSE for block systems
+    # Build kwargs for block systems: outputidxs + wrap_code with ForLoop generation
     block_kwargs = if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
-        (; outputidxs, cse = false, skipzeros = false, fillzeros = false)
+        iip_transform = _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
+        (; outputidxs, skipzeros = false, fillzeros = false,
+           wrap_code = (identity, iip_transform))
     else
         (;)
     end
@@ -136,13 +136,6 @@ function generate_rhs(
         expression = Val{true}, expression_module = eval_module,
         block_kwargs..., kwargs...
     )
-
-    # Post-process IIP Expr to replace block representative assignments with for-loops
-    if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
-        oop_expr, iip_expr = res
-        vectorize_iip_expr!(iip_expr, sys, block_eqs_meta)
-        res = (oop_expr, iip_expr)
-    end
     nargs = length(args) - length(p) + 1
     if is_dde(sys)
         p_start += 1
