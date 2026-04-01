@@ -267,17 +267,37 @@ function _vectorize_system(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlo
         end
     end
 
-    # Expand observed block equations (negative keys = pre-substituted algebraics)
+    # Expand eliminated algebraic block equations (negative keys).
+    # Simple variable assignments (v ~ rhs) go to observed.
+    # Algebraic constraints (0 ~ expr or complex_lhs ~ rhs) go to equations.
     new_obs = copy(observed(sys))
+    new_eqs = copy(equations(sys))
     for (key, block) in block_eqs
         key >= 0 && continue
         rep = block.representative_eq
+        rep_lhs = unwrap(rep.lhs)
         expanded = _expand_block_eq(rep, block)
-        append!(new_obs, expanded)
+
+        # Check if this is a simple variable assignment (LHS is a single variable)
+        if !SU._iszero(rep_lhs) && iscall(rep_lhs) && operation(rep_lhs) === getindex
+            # Simple variable assignment like v[k] ~ rhs → observed
+            append!(new_obs, expanded)
+        else
+            # Algebraic constraint — canonicalize to 0 ~ rhs - lhs form
+            for eq in expanded
+                eq_lhs = unwrap(eq.lhs)
+                if SU._iszero(eq_lhs)
+                    push!(new_eqs, eq)
+                else
+                    push!(new_eqs, Symbolics.COMMON_ZERO ~ eq.rhs - eq.lhs)
+                end
+            end
+        end
     end
 
     @set! sys.unknowns = new_dvs
     @set! sys.observed = new_obs
+    @set! sys.eqs = new_eqs
 
     # Store block_eqs metadata for codegen
     sys = SU.setmetadata(sys, MTKBase.BlockEquationsKey, block_eqs)
