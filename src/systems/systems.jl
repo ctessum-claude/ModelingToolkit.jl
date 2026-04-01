@@ -267,32 +267,26 @@ function _vectorize_system(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlo
         end
     end
 
-    # Expand eliminated algebraic block equations (negative keys).
-    # Simple variable assignments (v ~ rhs) go to observed.
-    # Algebraic constraints (0 ~ expr or complex_lhs ~ rhs) go to equations.
+    # Handle eliminated algebraic block equations (negative keys).
+    # Use the PRE-TEARING representative (which was correctly scalarized) for expansion,
+    # NOT the compiled representative (which may have had failing substitutions applied).
     new_obs = copy(observed(sys))
     new_eqs = copy(equations(sys))
     for (key, block) in block_eqs
         key >= 0 && continue
+        # Use the correctly-scalarized pre-tearing representative for expansion
         rep = block.representative_eq
         rep_lhs = unwrap(rep.lhs)
         expanded = _expand_block_eq(rep, block)
 
-        # Check if this is a simple variable assignment (LHS is a single variable)
+        # Classify: simple variable assignments → observed; algebraic constraints → skip
         if !SU._iszero(rep_lhs) && iscall(rep_lhs) && operation(rep_lhs) === getindex
             # Simple variable assignment like v[k] ~ rhs → observed
             append!(new_obs, expanded)
-        else
-            # Algebraic constraint — canonicalize to 0 ~ rhs - lhs form
-            for eq in expanded
-                eq_lhs = unwrap(eq.lhs)
-                if SU._iszero(eq_lhs)
-                    push!(new_eqs, eq)
-                else
-                    push!(new_eqs, Symbolics.COMMON_ZERO ~ eq.rhs - eq.lhs)
-                end
-            end
         end
+        # Algebraic constraints (0 ~ expr, e.g. Neumann BCs) were already incorporated
+        # into ODE equations via _presubstitute_block_algebraics! — don't add them
+        # anywhere (they'd cause equation count mismatches or observed LHS errors).
     end
 
     @set! sys.unknowns = new_dvs
