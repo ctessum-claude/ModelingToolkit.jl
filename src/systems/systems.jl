@@ -222,45 +222,41 @@ This makes mtkcompile O(1) in grid size — the only O(N) work is adding unknown
 function _vectorize_system(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlockInfo})
     compiled_dvs = unknowns(sys)
 
-    # Rebuild unknowns list, inserting all array elements contiguously at the
-    # representative's position. This ensures variable_index returns a contiguous
-    # range for each block, enabling du[loop_var + offset] in loop codegen.
+    # Rebuild unknowns list with all array elements in natural order (1,2,...,N).
+    # First add all block array elements contiguously, then remaining scalar unknowns.
+    # This ensures variable_index returns a contiguous range for each block.
     new_dvs = SymbolicT[]
     dvs_set = Set{SymbolicT}()
 
-    # Map from representative variable to its block
-    rep_var_to_block = Dict{SymbolicT, MTKTearing.ArrayBlockInfo}()
+    # Collect all base arrays from ODE blocks
+    block_arrays = Set{SymbolicT}()
     for (key, block) in block_eqs
         key < 0 && continue
         MTKBase.isdiffeq(block.representative_eq) || continue
         rep_lhs = unwrap(block.representative_eq.lhs)
-        rep_var = arguments(rep_lhs)[1]  # u(t)[k] from D(u(t)[k])
-        rep_var_to_block[unwrap(rep_var)] = block
+        rep_var = arguments(rep_lhs)[1]
+        if iscall(rep_var) && operation(rep_var) === getindex
+            push!(block_arrays, unwrap(arguments(rep_var)[1]))
+        end
     end
 
-    for dv in compiled_dvs
-        dv_uw = unwrap(dv)
-        if haskey(rep_var_to_block, dv_uw)
-            # This is a block representative — insert ALL array elements here
-            block = rep_var_to_block[dv_uw]
-            rep_lhs = unwrap(block.representative_eq.lhs)
-            inner = arguments(rep_lhs)[1]
-            if iscall(inner) && operation(inner) === getindex
-                base_arr = arguments(inner)[1]
-                base_sh = SU.shape(base_arr)
-                if SU.is_array_shape(base_sh)
-                    for idx in Iterators.product(base_sh...)
-                        var = unwrap(base_arr[idx...])
-                        if !(var in dvs_set)
-                            push!(new_dvs, var)
-                            push!(dvs_set, var)
-                        end
-                    end
-                    continue  # Don't add the representative again
-                end
+    # Phase 1: Add all elements of block arrays in natural order
+    for base_arr in block_arrays
+        base_sh = SU.shape(base_arr)
+        SU.is_array_shape(base_sh) || continue
+        for idx in Iterators.product(base_sh...)
+            var = unwrap(base_arr[idx...])
+            if !(var in dvs_set)
+                push!(new_dvs, var)
+                push!(dvs_set, var)
             end
         end
-        # Regular scalar unknown (or fallback)
+    end
+
+    # Phase 2: Add remaining compiled unknowns (scalar BCs, etc.) that aren't
+    # already covered by the block arrays
+    for dv in compiled_dvs
+        dv_uw = unwrap(dv)
         if !(dv_uw in dvs_set)
             push!(new_dvs, dv_uw)
             push!(dvs_set, dv_uw)

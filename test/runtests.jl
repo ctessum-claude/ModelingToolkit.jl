@@ -84,6 +84,10 @@ end
         @mtktestset("OptimizationSystem Test", "optimizationsystem.jl")
     end
 
+    if GROUP == "All" || GROUP == "ArrayOp"
+        @safetestset "ArrayOp Block Tearing" include("arrayop_block_tearing_test.jl")
+    end
+
     if GROUP == "All" || GROUP == "SymbolicIndexingInterface"
         @mtktestset("SciML Problem Input Test", "sciml_problem_inputs.jl")
         @mtktestset("MTKParameters Test", "mtkparameters.jl")
