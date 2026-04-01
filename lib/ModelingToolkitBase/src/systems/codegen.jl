@@ -569,12 +569,12 @@ function jacobian_sparsity(sys::System)
     sparsity = torn_system_jacobian_sparsity(sys)
     sparsity === nothing || return sparsity
 
-    # For block systems, M equations ≠ N unknowns, so skip symbolic sparsity
-    # and let the solver use dense Jacobian or AD.
+    # For block systems, compute sparsity from the representative stencil structure.
+    # Each block equation's representative has a fixed stencil pattern that tiles
+    # across all N elements, producing a banded/sparse pattern.
     block_eqs = getmetadata(sys, BlockEquationsKey, nothing)
     if block_eqs !== nothing && !isempty(block_eqs)
-        N = length(unknowns(sys))
-        return sparse(ones(Bool, N, N))  # Dense pattern
+        return _block_jacobian_sparsity(sys, block_eqs)
     end
 
     return Symbolics.jacobian_sparsity(
