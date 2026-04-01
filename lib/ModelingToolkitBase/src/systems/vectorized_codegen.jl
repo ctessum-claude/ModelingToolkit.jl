@@ -98,97 +98,63 @@ the representative RHS has a fixed stencil pattern (which unknowns it references
 This pattern is tiled across all N elements of the block, producing a banded/sparse
 matrix instead of a dense N×N pattern.
 
-For scalar (non-block) equations, sparsity is computed normally via Symbolics.
+For scalar (non-block) equations, sparsity is computed via `Symbolics.jacobian_sparsity`.
+
+Uses `_build_block_outputidxs` for consistent equation→du row mapping (same mapping
+used by `generate_rhs` for code generation).
 """
 function _block_jacobian_sparsity(sys, block_eqs)
     N = length(unknowns(sys))
-    dvs = unknowns(sys)
+    dvs = [unwrap(dv) for dv in unknowns(sys)]
     eqs = equations(sys)
+
+    # Get the consistent equation→du row mapping
+    outputidxs = _build_block_outputidxs(eqs, sys)
 
     I = Int[]
     J = Int[]
 
     for (i, eq) in enumerate(eqs)
-        # Find if this equation is a block representative
+        row = outputidxs[i]
         block = get(block_eqs, i, nothing)
 
         if block !== nothing && block.scalar_count > 1
-            # Block equation: compute stencil offsets from the representative
+            # Block equation: compute column offsets from the representative's RHS
+            # by finding which unknowns appear in it and computing their index offsets.
             rep_rhs = unwrap(eq.rhs)
 
-            # Find which du position this representative maps to
-            rep_lhs = unwrap(eq.lhs)
-            if isdiffeq(eq)
-                rep_var = arguments(rep_lhs)[1]
-                rep_pos = variable_index(sys, rep_var)
-            else
-                continue  # Non-ODE block — skip
-            end
-            rep_pos === nothing && continue
+            # Get column indices of unknowns referenced in the representative RHS
+            rep_sp = Symbolics.jacobian_sparsity([rep_rhs], dvs)
+            _, rep_cols, _ = SparseArrays.findnz(rep_sp)
 
-            # Find all unknowns referenced in the representative RHS
-            # and compute their offsets relative to rep_pos
-            offsets = Int[]
-            _collect_var_offsets!(offsets, rep_rhs, rep_pos, sys)
+            # Compute offsets relative to the representative's row position
+            offsets = [col - row for col in rep_cols]
 
             # Tile the offsets across all N elements of this block
             n = block.scalar_count
-            for k in 0:(n-1)
-                row = rep_pos + k
-                row > N && continue
+            for k in 0:(n - 1)
+                tile_row = row + k
+                tile_row > N && continue
                 for offset in offsets
-                    col = rep_pos + k + offset
+                    col = tile_row + offset
                     if 1 <= col <= N
-                        push!(I, row)
+                        push!(I, tile_row)
                         push!(J, col)
                     end
                 end
             end
         else
-            # Scalar equation: compute sparsity via Symbolics
-            eq_lhs = unwrap(eq.lhs)
-            if isdiffeq(eq)
-                eq_var = arguments(eq_lhs)[1]
-                eq_pos = variable_index(sys, eq_var)
-            else
-                continue  # Non-ODE scalar — skip
-            end
-            eq_pos === nothing && continue
-            # Get sparsity for this single equation against all unknowns
-            scalar_sp = Symbolics.jacobian_sparsity([unwrap(eq.rhs)], [unwrap(dv) for dv in dvs])
-            rows_sp, cols_sp, _ = SparseArrays.findnz(scalar_sp)
-            for col in cols_sp
-                push!(I, eq_pos)
+            # Scalar equation: compute sparsity directly via Symbolics
+            scalar_sp = Symbolics.jacobian_sparsity([unwrap(eq.rhs)], dvs)
+            _, cols, _ = SparseArrays.findnz(scalar_sp)
+            for col in cols
+                push!(I, row)
                 push!(J, col)
             end
         end
     end
 
     return SparseArrays.sparse(I, J, true, N, N)
-end
-
-"""
-Collect variable index offsets relative to rep_pos from a symbolic expression.
-For each getindex(arr, concrete_int) in the expression, computes offset = variable_index - rep_pos.
-"""
-function _collect_var_offsets!(offsets, expr, rep_pos, sys)
-    expr isa SymbolicT || return
-    if SU.iscall(expr)
-        f = operation(expr)
-        args = arguments(expr)
-        if f === getindex
-            # Try to get the variable_index for this indexed variable
-            vi = variable_index(sys, expr)
-            if vi !== nothing
-                push!(offsets, vi - rep_pos)
-                return  # Don't recurse into getindex children
-            end
-        end
-        # Recurse into arguments
-        for a in args
-            _collect_var_offsets!(offsets, a, rep_pos, sys)
-        end
-    end
 end
 
 """
