@@ -108,27 +108,31 @@ function generate_rhs(
         p_start += 1
     end
 
-    # For block systems: pass M equations with outputidxs + wrap_code that
-    # generates ForLoop IR objects for block equations. This produces O(M) code
-    # instead of O(N), with CSE correctly scoping loop bodies.
+    # For block systems: detect dimensionality and choose codegen strategy.
+    # 1D blocks: ForLoop IR via wrap_code (O(M) generated code)
+    # 2D+ blocks: fall back to scalar expansion (O(N) but correct for all dimensions)
     block_eqs_meta = nothing
+    block_kwargs = (;)
     if !implicit_dae && !scalar
         block_eqs_meta = getmetadata(sys, BlockEquationsKey, nothing)
         if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
-            # Inline observed into block representative RHSs (makes them self-contained)
-            rhss = _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
-            # Build outputidxs mapping each equation to its du[] position
-            outputidxs = _build_block_outputidxs(eqs, sys)
-        end
-    end
+            # Check if any block has multiple dimensions
+            has_multidim = _has_multidim_blocks(block_eqs_meta)
 
-    # Build kwargs for block systems: outputidxs + wrap_code with ForLoop generation
-    block_kwargs = if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
-        iip_transform = _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
-        (; outputidxs, skipzeros = false, fillzeros = false,
-           wrap_code = (identity, iip_transform))
-    else
-        (;)
+            if has_multidim
+                # 2D+ blocks: expand M representatives to N scalar rhss at codegen time.
+                # This is O(N) but correctly handles all dimensions and stencil patterns.
+                # The O(1) tearing benefit still applies — only codegen is O(N).
+                rhss, eqs = _expand_rhss_for_codegen(rhss, eqs, sys, block_eqs_meta)
+            else
+                # 1D blocks: ForLoop IR (O(M) codegen)
+                rhss = _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
+                outputidxs = _build_block_outputidxs(eqs, sys)
+                iip_transform = _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
+                block_kwargs = (; outputidxs, skipzeros = false, fillzeros = false,
+                                  wrap_code = (identity, iip_transform))
+            end
+        end
     end
 
     res = build_function_wrapper(

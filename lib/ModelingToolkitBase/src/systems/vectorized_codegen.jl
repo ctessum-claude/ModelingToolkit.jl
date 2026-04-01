@@ -41,6 +41,23 @@ function _get_arrayop_index_info_local(ao)
 end
 
 """
+Check if any block equation has multiple output dimensions (2D+ ArrayOp).
+"""
+function _has_multidim_blocks(block_eqs_meta)
+    for (key, block) in block_eqs_meta
+        key < 0 && continue
+        ao = _find_arrayop_local(unwrap(block.original_eq.lhs))
+        if ao === nothing
+            ao = _find_arrayop_local(unwrap(block.original_eq.rhs))
+        end
+        ao === nothing && continue
+        output_idx, _, _ = _get_arrayop_index_info_local(ao)
+        length(output_idx) > 1 && return true
+    end
+    return false
+end
+
+"""
     _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
 
 Inline observed variable definitions into block representative RHSs so they become
