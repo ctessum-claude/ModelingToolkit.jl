@@ -105,6 +105,95 @@ function _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
 end
 
 """
+    _resolve_block_observed_expr(sys, sym, block_eqs_meta)
+
+For block-observed variables (eliminated algebraic blocks), resolve `sym` to concrete
+expressions computable from unknowns. Returns resolved expression(s), or `nothing`
+if `sym` is not a block-observed variable.
+
+- `sym = v(t)[i]` → returns scalar expression for v[i]
+- `sym = v(t)` (array) → returns array of expressions [v[1], ..., v[N]]
+
+This enables O(M) storage: block algebraic equations are NOT expanded to N scalar
+observed equations. Instead, the representative equation + index shifting generates
+the expression on demand.
+"""
+function _resolve_block_observed_expr(sys, sym, block_eqs_meta)
+    sym_uw = unwrap(sym)
+
+    # Build lookup: base_variable => (block, rep_idx_vals, iter_ranges)
+    # Includes both namespaced and un-namespaced keys for matching compiled.v[i]
+    block_lookup = _build_block_observed_lookup(block_eqs_meta, sys)
+    isempty(block_lookup) && return nothing
+
+    # Case 1: sym = v(t)[i] — indexed access to a single element
+    if SU.iscall(sym_uw) && operation(sym_uw) === getindex
+        base_var = arguments(sym_uw)[1]
+        info = get(block_lookup, base_var, nothing)
+        info === nothing && return nothing
+
+        block, rep_idx_vals, _, _ = info
+        target_idxs = [Int(SU.unwrap_const(arguments(sym_uw)[k])) for k in 2:length(arguments(sym_uw))]
+        shifts = [target_idxs[d] - rep_idx_vals[d] for d in eachindex(rep_idx_vals)]
+
+        rep_rhs = unwrap(block.representative_eq.rhs)
+        return _shift_array_indices_multidim_sym(rep_rhs, shifts)
+    end
+
+    # Case 2: sym = v(t) — full array access
+    for (_, (block, rep_idx_vals, iter_ranges, orig_base_var)) in block_lookup
+        if isequal(sym_uw, orig_base_var) || isequal(sym_uw, renamespace(sys, orig_base_var))
+            rep_rhs = unwrap(block.representative_eq.rhs)
+            results = SymbolicT[]
+            for idx_tuple in Iterators.product(iter_ranges...)
+                shifts = [idx_tuple[d] - rep_idx_vals[d] for d in eachindex(rep_idx_vals)]
+                push!(results, _shift_array_indices_multidim_sym(rep_rhs, shifts))
+            end
+            return results
+        end
+    end
+
+    return nothing
+end
+
+"""Build lookup from base variable to block info for observed blocks (negative keys).
+Stores both namespaced and un-namespaced keys to handle compiled.v[i] access."""
+function _build_block_observed_lookup(block_eqs_meta, sys)
+    lookup = Dict{Any, Tuple}()
+    for (key, block) in block_eqs_meta
+        key >= 0 && continue
+        rep = block.representative_eq
+        rep_lhs = unwrap(rep.lhs)
+        SU._iszero(rep_lhs) && continue
+
+        SU.iscall(rep_lhs) && operation(rep_lhs) === getindex || continue
+        base_var = arguments(rep_lhs)[1]
+
+        # Extract representative index values and iteration ranges from original ArrayOp
+        ao = _find_arrayop_local(unwrap(block.original_eq.lhs))
+        ao === nothing && (ao = _find_arrayop_local(unwrap(block.original_eq.rhs)))
+        ao === nothing && continue
+
+        output_idx, ranges, sh = _get_arrayop_index_info_local(ao)
+        isempty(output_idx) && continue
+
+        rep_idx_vals = Int[]
+        for (dim_i, ii) in enumerate(output_idx)
+            push!(rep_idx_vals, haskey(ranges, ii) ? first(ranges[ii]) : first(sh[dim_i]))
+        end
+
+        iter_ranges = [haskey(ranges, ii) ? ranges[ii] : sh[dim_i]
+                       for (dim_i, ii) in enumerate(output_idx)]
+
+        info = (block, rep_idx_vals, iter_ranges, base_var)
+        lookup[base_var] = info
+        # Also store namespaced key for matching compiled.v[i]
+        lookup[renamespace(sys, base_var)] = info
+    end
+    return lookup
+end
+
+"""
     _block_jacobian_sparsity(sys, block_eqs)
 
 Compute Jacobian sparsity from block stencil structure. For each block equation,

@@ -436,6 +436,19 @@ function SymbolicIndexingInterface.observed(
             end
         end
     end
+    # Check for block-observed variables (from block tearing).
+    # These are eliminated algebraic blocks stored in block_eqs metadata — NOT in
+    # observed(sys). Resolve them to expressions in terms of unknowns on demand.
+    block_eqs_meta = SU.getmetadata(sys, BlockEquationsKey, nothing)
+    if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
+        resolved = _resolve_block_observed_expr(sys, sym, block_eqs_meta)
+        if resolved !== nothing
+            return build_explicit_observed_function(
+                sys, resolved; eval_expression, eval_module, checkbounds, cse, optimize
+            )
+        end
+    end
+
     return build_explicit_observed_function(
         sys, sym; eval_expression, eval_module, checkbounds, cse, optimize
     )
