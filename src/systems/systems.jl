@@ -263,27 +263,22 @@ function _vectorize_system(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlo
         end
     end
 
-    # Handle eliminated algebraic block equations (negative keys).
-    # Use the PRE-TEARING representative (which was correctly scalarized) for expansion,
-    # NOT the compiled representative (which may have had failing substitutions applied).
+    # Expand eliminated algebraic block equations (negative keys) to N scalar observed
+    # equations so they're accessible via sol[compiled.v] and sol[compiled.v[i]].
+    # The codegen pipeline (generate_rhs) uses block_eqs metadata for O(M) ForLoop IR,
+    # so these expanded equations are only used for solution-time observed access.
     new_obs = copy(observed(sys))
-    new_eqs = copy(equations(sys))
     for (key, block) in block_eqs
-        key >= 0 && continue
-        # Use the correctly-scalarized pre-tearing representative for expansion
+        key >= 0 && continue  # Only process negative keys (eliminated algebraics)
         rep = block.representative_eq
         rep_lhs = unwrap(rep.lhs)
+        # Only expand variable assignments (v[k] ~ rhs) to observed.
+        # Skip algebraic constraints (0 ~ expr) — they were already pre-substituted.
+        SU._iszero(rep_lhs) && continue
         expanded = _expand_block_eq(rep, block)
-
-        # Classify: simple variable assignments → observed; algebraic constraints → skip
-        if !SU._iszero(rep_lhs) && iscall(rep_lhs) && operation(rep_lhs) === getindex
-            # Simple variable assignment like v[k] ~ rhs → observed
-            append!(new_obs, expanded)
-        end
-        # Algebraic constraints (0 ~ expr, e.g. Neumann BCs) were already incorporated
-        # into ODE equations via _presubstitute_block_algebraics! — don't add them
-        # anywhere (they'd cause equation count mismatches or observed LHS errors).
+        append!(new_obs, expanded)
     end
+    new_eqs = copy(equations(sys))
 
     @set! sys.unknowns = new_dvs
     @set! sys.observed = new_obs

@@ -37,13 +37,18 @@ using SparseArrays
         compiled = mtkcompile(sys)
 
         @test length(unknowns(compiled)) == 5
-        @test length(observed(compiled)) >= 5  # v should be observed
+        # v is eliminated via pre-substitution and expanded to observed for solution access
 
         prob = ODEProblem(compiled, [compiled.u[i] => Float64(i) for i in 1:5], (0.0, 1.0))
         sol = solve(prob)
         @test sol.retcode == ReturnCode.Success
         for i in 1:5
             @test sol[compiled.u[i]][end] ≈ Float64(i) * exp(-1.0) rtol=1e-6
+        end
+
+        # Verify observed block access: individual elements
+        for i in 1:5
+            @test sol[compiled.v[i]][end] ≈ -Float64(i) * exp(-1.0) rtol=1e-6
         end
     end
 
@@ -91,7 +96,7 @@ using SparseArrays
         compiled = mtkcompile(sys)
 
         @test length(unknowns(compiled)) == N
-        # flux should be observed
+        # flux is eliminated via pre-substitution and expanded to observed for solution access
         has_flux_obs = any(observed(compiled)) do eq
             occursin("flux", string(eq.lhs))
         end

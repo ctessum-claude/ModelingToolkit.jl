@@ -68,15 +68,29 @@ Only block representative RHSs are modified. Scalar equation RHSs are unchanged
 (their observed deps are handled normally by build_function_wrapper).
 """
 function _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
-    obs = observed(sys)
-    isempty(obs) && return rhss
-
-    # Build observed substitution dict
+    # Build observed substitution dict from TWO sources:
+    # 1. Scalar observed equations in sys.observed (O(M_scalar))
+    # 2. Block algebraic representatives from negative-key block_eqs (O(M_block))
+    # This is O(M) total, NOT O(N).
     obs_dict = Dict{SymbolicT, Any}()
-    for eq in obs
+
+    # Source 1: scalar observed
+    for eq in observed(sys)
         lhs_uw = unwrap(eq.lhs)
         obs_dict[lhs_uw] = unwrap(eq.rhs)
     end
+
+    # Source 2: block algebraic representatives (negative keys)
+    # The representative defines v[k0] ~ rhs_at_k0. We add this single entry.
+    # The parameterized ForLoop will shift the indices automatically.
+    for (key, block) in block_eqs_meta
+        key >= 0 && continue
+        rep = block.representative_eq
+        rep_lhs = unwrap(rep.lhs)
+        SU._iszero(rep_lhs) && continue  # Skip algebraic constraints (0 ~ expr)
+        obs_dict[rep_lhs] = unwrap(rep.rhs)
+    end
+
     isempty(obs_dict) && return rhss
 
     new_rhss = collect(rhss)
