@@ -121,6 +121,43 @@ using SparseArrays
         @test nnz(sp) <= 3 * N  # At most tridiagonal
     end
 
+    @testset "Rearranged algebraic eq (expr ~ 0 form)" begin
+        # Regression test: when the algebraic equation is in rearranged form
+        # (e.g., -1 - 0.5sin(u[i]) + v[i] ~ 0 instead of v[i] ~ 1 + 0.5sin(u[i])),
+        # the block tearing must still correctly substitute and solve.
+        # This is the form MethodOfLines produces for PDE algebraic equations.
+        N = 5
+        @variables (u(t))[1:N] (v(t))[1:N]
+
+        # ODE: D(u[i]) ~ v[i] (uses the algebraic variable)
+        lhso = @arrayop (i,) D(u[i]) i in 1:N
+        rhso = @arrayop (i,) v[i] i in 1:N
+
+        # Algebraic in REARRANGED form: (-1 - 0.5sin(u[i]) + v[i]) ~ (v[i] - v[i])
+        # The RHS simplifies to 0. This tests the case where the LHS is NOT a clean
+        # getindex but a sum expression containing the algebraic variable.
+        lhsa = @arrayop (i,) -1.0 - 0.5*sin(u[i]) + v[i] i in 1:N
+        rhsa = @arrayop (i,) v[i] - v[i] i in 1:N
+
+        dvs = [[u[i] for i in 1:N]; [v[i] for i in 1:N]]
+        @named sys = System([lhso ~ rhso, lhsa ~ rhsa], t, dvs, []; checks=false)
+        compiled = mtkcompile(sys)
+
+        # v should be eliminated — only u unknowns remain
+        @test length(unknowns(compiled)) == N
+
+        # No v references in compiled equations (v is fully substituted)
+        for eq in equations(compiled)
+            eq_str = string(eq)
+            @test !occursin("v(t)", eq_str)
+        end
+
+        # The ODE should solve successfully with v inlined
+        prob = ODEProblem(compiled, [compiled.u[i] => Float64(i) for i in 1:N], (0.0, 1.0))
+        sol = solve(prob)
+        @test sol.retcode == ReturnCode.Success
+    end
+
     # MOL integration tests are in MethodOfLines.jl's own test suite.
     # Run them manually via:
     #   cd MethodOfLines.jl && julia --project -e 'ENV["GROUP"]="ArrayDisc"; using Pkg; Pkg.test()'

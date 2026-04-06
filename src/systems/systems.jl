@@ -274,8 +274,22 @@ function _vectorize_system(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlo
     @set! sys.observed = new_obs
     @set! sys.eqs = new_eqs
 
-    # Store block_eqs metadata for codegen
-    sys = SU.setmetadata(sys, MTKBase.BlockEquationsKey, block_eqs)
+    # Remap block_eqs keys from TearingState equation indices to compiled
+    # equation indices. The codegen functions (e.g., _inline_block_observed_into_rhss)
+    # look up blocks by compiled equation index, so the keys must match.
+    remapped_block_eqs = Dict{Int, MTKTearing.ArrayBlockInfo}()
+    for (key, block) in block_eqs
+        if key < 0
+            # Negative keys (eliminated algebraic blocks) stay as-is
+            remapped_block_eqs[key] = block
+        elseif block.compiled_eq_idx !== nothing
+            # Remap to compiled equation index
+            remapped_block_eqs[block.compiled_eq_idx] = block
+        end
+    end
+
+    # Store remapped block_eqs metadata for codegen
+    sys = SU.setmetadata(sys, MTKBase.BlockEquationsKey, remapped_block_eqs)
 
     return MTKBase.invalidate_cache!(sys)
 end
