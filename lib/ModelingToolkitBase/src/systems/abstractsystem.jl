@@ -294,6 +294,17 @@ function SymbolicIndexingInterface.timeseries_parameter_index(sys::AbstractSyste
 end
 
 function SymbolicIndexingInterface.parameter_observed(sys::AbstractSystem, sym)
+    # Block-observed variables (eliminated algebraic blocks) must be resolved to
+    # expressions in terms of unknowns before being passed to
+    # build_explicit_observed_function, which validates that all referenced symbols
+    # are present in the system.
+    block_eqs_meta = SU.getmetadata(sys, BlockEquationsKey, nothing)
+    if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
+        resolved = _resolve_block_observed_for_observed(sys, sym, block_eqs_meta)
+        if resolved !== nothing
+            return build_explicit_observed_function(sys, resolved; param_only = true)
+        end
+    end
     return build_explicit_observed_function(sys, sym; param_only = true)
 end
 
@@ -337,7 +348,13 @@ for traitT in [
                 # DDEs case, to detect x(t - k)
                 push!(ts_idxs, ContinuousTimeseries())
             else
-                if has_index_cache(sys) && (ic = get_index_cache(sys)) !== nothing
+                # Block-observed variables (from block tearing) are not in the
+                # index cache — check them before falling through to the cache lookup.
+                block_eqs_meta = SU.getmetadata(sys, BlockEquationsKey, nothing)
+                if block_eqs_meta !== nothing && !isempty(block_eqs_meta) &&
+                   _resolve_block_observed_expr(sys, s, block_eqs_meta) !== nothing
+                    push!(ts_idxs, ContinuousTimeseries())
+                elseif has_index_cache(sys) && (ic = get_index_cache(sys)) !== nothing
                     if (ts = get(ic.observed_syms_to_timeseries, s, nothing)) !== nothing
                         union!(ts_idxs, ts)
                     elseif (ts = get(ic.dependent_pars_to_timeseries, s, nothing)) !==
@@ -441,7 +458,7 @@ function SymbolicIndexingInterface.observed(
     # observed(sys). Resolve them to expressions in terms of unknowns on demand.
     block_eqs_meta = SU.getmetadata(sys, BlockEquationsKey, nothing)
     if block_eqs_meta !== nothing && !isempty(block_eqs_meta)
-        resolved = _resolve_block_observed_expr(sys, sym, block_eqs_meta)
+        resolved = _resolve_block_observed_for_observed(sys, sym, block_eqs_meta)
         if resolved !== nothing
             return build_explicit_observed_function(
                 sys, resolved; eval_expression, eval_module, checkbounds, cse, optimize
@@ -452,6 +469,27 @@ function SymbolicIndexingInterface.observed(
     return build_explicit_observed_function(
         sys, sym; eval_expression, eval_module, checkbounds, cse, optimize
     )
+end
+
+"""
+Dispatch helper for block-observed resolution in `observed`. Handles both scalar
+and vector/tuple symbols. Returns the resolved expression(s), or `nothing` if
+none of the input symbols are block-observed.
+"""
+function _resolve_block_observed_for_observed(sys, sym, block_eqs_meta)
+    if sym isa AbstractArray || sym isa Tuple
+        any_resolved = false
+        resolved_elems = map(sym) do s
+            r = _resolve_block_observed_expr(sys, s, block_eqs_meta)
+            if r !== nothing
+                any_resolved = true
+                return r
+            end
+            return unwrap(s)
+        end
+        return any_resolved ? collect(resolved_elems) : nothing
+    end
+    return _resolve_block_observed_expr(sys, sym, block_eqs_meta)
 end
 
 function SymbolicIndexingInterface.default_values(sys::AbstractSystem)

@@ -215,12 +215,15 @@ Prepare a block-teared system for vectorized codegen. Instead of expanding M rep
 equations to N scalar equations (O(N)), this function:
 1. Adds all N scalar unknowns (needed for IndexCache and u0 mapping)
 2. Stores block_eqs and eliminated_block_eqs as metadata on the system (used by generate_rhs for loop codegen)
-3. Expands only observed block equations (needed for user access to observed variables)
-4. Keeps the M representative equations as the system's equation list
+3. Keeps the M representative equations as the system's equation list
 
 This makes mtkcompile O(1) in grid size — the only O(N) work is adding unknowns to a list.
 """
-function _vectorize_system(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlockInfo}, eliminated_block_eqs::Vector{MTKTearing.ArrayBlockInfo})
+function _vectorize_system(
+        sys::System,
+        block_eqs::Dict{Int, MTKTearing.ArrayBlockInfo},
+        eliminated_block_eqs::Vector{MTKTearing.ArrayBlockInfo} = MTKTearing.ArrayBlockInfo[],
+    )
     compiled_dvs = unknowns(sys)
 
     # Rebuild unknowns list with all array elements in natural order (1,2,...,N).
@@ -278,6 +281,11 @@ function _vectorize_system(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlo
     # Remap block_eqs keys from TearingState equation indices to compiled
     # equation indices. The codegen functions (e.g., _inline_block_observed_into_rhss)
     # look up blocks by compiled equation index, so the keys must match.
+    #
+    # Eliminated algebraic blocks (from `_presubstitute_block_algebraics!`) are stored
+    # separately in `eliminated_block_eqs` as a Vector. We give them negative keys in the
+    # metadata Dict so downstream code (codegen and `_resolve_block_observed_expr`)
+    # can distinguish them from live ODE/algebraic representatives.
     remapped_block_eqs = Dict{Int, MTKTearing.ArrayBlockInfo}()
     for (key, block) in block_eqs
         if block.compiled_eq_idx !== nothing

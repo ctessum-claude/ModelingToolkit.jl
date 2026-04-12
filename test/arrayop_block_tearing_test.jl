@@ -47,10 +47,12 @@ using SparseArrays
             @test sol[compiled.u[i]][end] ≈ Float64(i) * exp(-1.0) rtol=1e-6
         end
 
-        # Block-level observed access (sol[compiled.v]) requires SymbolicIndexingInterface
-        # getu path to support block-observed resolution. This is a known limitation —
-        # the observed() method resolves correctly but getu/getsym bypasses it.
-        # TODO: Extend getu to use block-observed resolution.
+        # Verify block-level observed access: sol[compiled.v] returns the whole block
+        # as Vector{Vector{Float64}} (one entry per timestep, each an array of 5 values)
+        v_vals = sol[compiled.v]
+        for i in 1:5
+            @test v_vals[end][i] ≈ -Float64(i) * exp(-1.0) rtol=1e-6
+        end
     end
 
     @testset "1D stencil (diffusion)" begin
@@ -158,7 +160,7 @@ using SparseArrays
         @test sol.retcode == ReturnCode.Success
     end
 
-    @testset "Block-observed resolution (observed() method)" begin
+    @testset "Block-observed indexed access (sol[compiled.v[i]])" begin
         @variables (u(t))[1:5] (v(t))[1:5]
         lhso = @arrayop (i,) D(u[i]) i in 1:5
         rhso = @arrayop (i,) v[i] i in 1:5
@@ -168,24 +170,14 @@ using SparseArrays
         @named sys = System([lhso ~ rhso, lhsa ~ rhsa], t, dvs, []; checks=false)
         compiled = mtkcompile(sys)
 
-        # Verify observed() resolves block-observed variables correctly
-        block_eqs_meta = SymbolicUtils.getmetadata(compiled, ModelingToolkitBase.BlockEquationsKey, nothing)
-        @test block_eqs_meta !== nothing
+        prob = ODEProblem(compiled, [compiled.u[i] => Float64(i) for i in 1:5], (0.0, 1.0))
+        sol = solve(prob)
+        @test sol.retcode == ReturnCode.Success
 
-        # Indexed access: v[i] resolves to -u[i]
+        # Test indexed access: sol[compiled.v[i]] for each element
         for i in 1:5
-            resolved = ModelingToolkitBase._resolve_block_observed_expr(compiled, compiled.v[i], block_eqs_meta)
-            @test resolved !== nothing
+            @test sol[compiled.v[i]][end] ≈ -Float64(i) * exp(-1.0) rtol=1e-6
         end
-
-        # Full array access: v resolves to [-u[1], ..., -u[5]]
-        resolved_all = ModelingToolkitBase._resolve_block_observed_expr(compiled, compiled.v, block_eqs_meta)
-        @test resolved_all !== nothing
-        @test length(resolved_all) == 5
-
-        # The observed() method produces a callable function
-        obs_fn = SymbolicIndexingInterface.observed(compiled, compiled.v[1])
-        @test obs_fn !== nothing
     end
 
     @testset "2D ArrayOp (nested ForLoop codegen)" begin
