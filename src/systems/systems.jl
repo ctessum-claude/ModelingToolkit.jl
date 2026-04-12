@@ -47,11 +47,12 @@ function MTKBase.__mtkcompile(
     end
     if isempty(brown_vars)
         block_eqs = state.block_eqs
+        eliminated_block_eqs = state.eliminated_block_eqs
         result = mtkcompile!(
             state; inputs, outputs, disturbance_inputs, kwargs...
         )
-        if !isempty(block_eqs)
-            result = _vectorize_system(result, block_eqs)
+        if !isempty(block_eqs) || !isempty(eliminated_block_eqs)
+            result = _vectorize_system(result, block_eqs, eliminated_block_eqs)
         end
         return result
     else
@@ -208,18 +209,18 @@ Mark whether an extra pass `p` can support compiling discrete systems.
 discrete_compile_pass(p) = false
 
 """
-    _vectorize_system(sys, block_eqs)
+    _vectorize_system(sys, block_eqs, eliminated_block_eqs)
 
 Prepare a block-teared system for vectorized codegen. Instead of expanding M representative
 equations to N scalar equations (O(N)), this function:
 1. Adds all N scalar unknowns (needed for IndexCache and u0 mapping)
-2. Stores block_eqs as metadata on the system (used by generate_rhs for loop codegen)
+2. Stores block_eqs and eliminated_block_eqs as metadata on the system (used by generate_rhs for loop codegen)
 3. Expands only observed block equations (needed for user access to observed variables)
 4. Keeps the M representative equations as the system's equation list
 
 This makes mtkcompile O(1) in grid size — the only O(N) work is adding unknowns to a list.
 """
-function _vectorize_system(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlockInfo})
+function _vectorize_system(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlockInfo}, eliminated_block_eqs::Vector{MTKTearing.ArrayBlockInfo})
     compiled_dvs = unknowns(sys)
 
     # Rebuild unknowns list with all array elements in natural order (1,2,...,N).
@@ -231,7 +232,7 @@ function _vectorize_system(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlo
     # Collect all base arrays from ODE blocks
     block_arrays = Set{SymbolicT}()
     for (key, block) in block_eqs
-        key < 0 && continue
+        block.eliminated && continue
         MTKBase.isdiffeq(block.representative_eq) || continue
         rep_lhs = unwrap(block.representative_eq.lhs)
         rep_var = arguments(rep_lhs)[1]
@@ -279,17 +280,14 @@ function _vectorize_system(sys::System, block_eqs::Dict{Int, MTKTearing.ArrayBlo
     # look up blocks by compiled equation index, so the keys must match.
     remapped_block_eqs = Dict{Int, MTKTearing.ArrayBlockInfo}()
     for (key, block) in block_eqs
-        if key < 0
-            # Negative keys (eliminated algebraic blocks) stay as-is
-            remapped_block_eqs[key] = block
-        elseif block.compiled_eq_idx !== nothing
-            # Remap to compiled equation index
+        if block.compiled_eq_idx !== nothing
             remapped_block_eqs[block.compiled_eq_idx] = block
         end
     end
 
-    # Store remapped block_eqs metadata for codegen
+    # Store remapped block_eqs and eliminated_block_eqs metadata for codegen
     sys = SU.setmetadata(sys, MTKBase.BlockEquationsKey, remapped_block_eqs)
+    sys = SU.setmetadata(sys, MTKBase.EliminatedBlockEquationsKey, eliminated_block_eqs)
 
     return MTKBase.invalidate_cache!(sys)
 end
@@ -343,13 +341,15 @@ function _expand_arrayop_blocks(sys::System, block_eqs::Dict{Int, MTKTearing.Arr
     end
 
     # Expand pre-substituted algebraic blocks as observed equations.
-    # These were eliminated during TearingState construction (stored with negative keys)
-    # and need to be added as observed equations for the solver.
-    for (key, block) in block_eqs
-        key >= 0 && continue  # Only process negative keys (eliminated algebraics)
-        rep = block.representative_eq
-        expanded = _expand_block_eq(rep, block)
-        append!(new_obs, expanded)
+    # These were eliminated during TearingState construction and need to be
+    # added as observed equations for the solver.
+    elim_meta = SU.getmetadata(sys, MTKBase.EliminatedBlockEquationsKey, nothing)
+    if elim_meta !== nothing
+        for block in elim_meta
+            rep = block.representative_eq
+            expanded = _expand_block_eq(rep, block)
+            append!(new_obs, expanded)
+        end
     end
 
     @set! sys.eqs = new_eqs

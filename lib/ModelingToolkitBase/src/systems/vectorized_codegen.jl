@@ -9,6 +9,9 @@ reducing Julia compilation time from O(N) to O(1) in the number of grid points.
 """Metadata key for storing block equation info on a compiled system."""
 struct BlockEquationsKey end
 
+"""Metadata key for storing eliminated (pre-substituted) block equations on a compiled system."""
+struct EliminatedBlockEquationsKey end
+
 import Moshi.Match: @match
 import SymbolicUtils as _SU_VC
 using Symbolics: SymbolicT
@@ -45,7 +48,7 @@ Check if any block equation has multiple output dimensions (2D+ ArrayOp).
 """
 function _has_multidim_blocks(block_eqs_meta)
     for (key, block) in block_eqs_meta
-        key < 0 && continue
+        block.eliminated && continue
         ao = _find_arrayop_local(unwrap(block.original_eq.lhs))
         if ao === nothing
             ao = _find_arrayop_local(unwrap(block.original_eq.rhs))
@@ -70,7 +73,7 @@ Only block representative RHSs are modified. Scalar equation RHSs are unchanged
 function _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
     # Build observed substitution dict from TWO sources:
     # 1. Scalar observed equations in sys.observed (O(M_scalar))
-    # 2. Block algebraic representatives from negative-key block_eqs (O(M_block))
+    # 2. Block algebraic representatives from eliminated_block_eqs (O(M_block))
     # This is O(M) total, NOT O(N).
     obs_dict = Dict{SymbolicT, Any}()
 
@@ -80,15 +83,17 @@ function _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
         obs_dict[lhs_uw] = unwrap(eq.rhs)
     end
 
-    # Source 2: block algebraic representatives (negative keys)
+    # Source 2: eliminated block algebraic representatives
     # The representative defines v[k0] ~ rhs_at_k0. We add this single entry.
     # The parameterized ForLoop will shift the indices automatically.
-    for (key, block) in block_eqs_meta
-        key >= 0 && continue
-        rep = block.representative_eq
-        rep_lhs = unwrap(rep.lhs)
-        SU._iszero(rep_lhs) && continue  # Skip algebraic constraints (0 ~ expr)
-        obs_dict[rep_lhs] = unwrap(rep.rhs)
+    elim_blocks = getmetadata(sys, EliminatedBlockEquationsKey, nothing)
+    if elim_blocks !== nothing
+        for block in elim_blocks
+            rep = block.representative_eq
+            rep_lhs = unwrap(rep.lhs)
+            SU._iszero(rep_lhs) && continue  # Skip algebraic constraints (0 ~ expr)
+            obs_dict[rep_lhs] = unwrap(rep.rhs)
+        end
     end
 
     isempty(obs_dict) && return rhss
@@ -156,12 +161,13 @@ function _resolve_block_observed_expr(sys, sym, block_eqs_meta)
     return nothing
 end
 
-"""Build lookup from base variable to block info for observed blocks (negative keys).
+"""Build lookup from base variable to block info for eliminated observed blocks.
 Stores both namespaced and un-namespaced keys to handle compiled.v[i] access."""
 function _build_block_observed_lookup(block_eqs_meta, sys)
+    elim_blocks = getmetadata(sys, EliminatedBlockEquationsKey, nothing)
     lookup = Dict{Any, Tuple}()
-    for (key, block) in block_eqs_meta
-        key >= 0 && continue
+    elim_blocks === nothing && return lookup
+    for block in elim_blocks
         rep = block.representative_eq
         rep_lhs = unwrap(rep.lhs)
         SU._iszero(rep_lhs) && continue
