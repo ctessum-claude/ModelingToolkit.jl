@@ -282,10 +282,8 @@ function _vectorize_system(
     # equation indices. The codegen functions (e.g., _inline_block_observed_into_rhss)
     # look up blocks by compiled equation index, so the keys must match.
     #
-    # Eliminated algebraic blocks (from `_presubstitute_block_algebraics!`) are stored
-    # separately in `eliminated_block_eqs` as a Vector. We give them negative keys in the
-    # metadata Dict so downstream code (codegen and `_resolve_block_observed_expr`)
-    # can distinguish them from live ODE/algebraic representatives.
+    # Eliminated algebraic blocks (from `_presubstitute_block_algebraics!`) are
+    # stored separately under `EliminatedBlockEquationsKey` below, not in this Dict.
     remapped_block_eqs = Dict{Int, MTKTearing.ArrayBlockInfo}()
     for (key, block) in block_eqs
         if block.compiled_eq_idx !== nothing
