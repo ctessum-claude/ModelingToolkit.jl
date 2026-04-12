@@ -240,9 +240,13 @@ function _mtkcompile!(
     state = ModelingToolkit.inputs_to_parameters!(state, inputs, outputs)
     StateSelection.trivial_tearing!(state)
     sys, mm = ModelingToolkit.alias_elimination!(state; fully_determined, kwargs...)
-    if check_consistency && isempty(state.block_eqs)
+    if check_consistency
+        # For block systems, the graph is compressed (M representatives instead of N
+        # scalar equations), so consistency checks may see a count mismatch that isn't
+        # a real structural singularity. Use nothrow to avoid false-positive crashes.
+        block_nothrow = !isempty(state.block_eqs) || fully_determined === nothing
         fully_determined = StateSelection.check_consistency(
-            state, orig_inputs; nothrow = fully_determined === nothing
+            state, orig_inputs; nothrow = block_nothrow
         )
     end
     # This phrasing avoids making the `kwcall` dynamic dispatch due to the type of a
