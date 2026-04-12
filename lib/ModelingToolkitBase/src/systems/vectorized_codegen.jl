@@ -15,28 +15,44 @@ struct EliminatedBlockEquationsKey end
 import Moshi.Match: @match
 using Symbolics: SymbolicT
 
-"""Find the first ArrayOp in an expression, looking inside D() wrappers. (Local copy for MTKBase.)"""
-function _find_arrayop_local(expr)
+"""
+    _find_arrayop(expr)
+
+Find the first `ArrayOp` node in a symbolic expression, descending through
+operator wrappers like `Differential`. Returns the `ArrayOp` or `nothing`.
+
+Implementation: uses `SU.search_variables!` with `SU.isarrayop` as the
+atomicity predicate — this treats `ArrayOp` nodes as leaves and returns the
+first one encountered.
+
+This is the MTKBase-level canonical definition. `ModelingToolkitTearing`
+re-exports it so tearing code can call it unqualified.
+"""
+function _find_arrayop(expr)
     expr isa SymbolicT || return nothing
-    @match expr begin
-        SU.BSImpl.ArrayOp(;) => return expr
-        SU.BSImpl.Term(; f, args) => begin
-            for arg in args
-                ao = _find_arrayop_local(arg)
-                ao !== nothing && return ao
-            end
-            return nothing
-        end
-        _ => return nothing
-    end
+    buffer = Set{SymbolicT}()
+    SU.search_variables!(buffer, expr; is_atomic = SU.isarrayop)
+    isempty(buffer) && return nothing
+    return first(buffer)
 end
 
-"""Extract output_idx symbols, ranges dict, and shape from an ArrayOp. (Local copy for MTKBase.)"""
-function _get_arrayop_index_info_local(ao)
+"""
+    _get_arrayop_index_info(ao)
+
+Extract the iteration metadata from an `ArrayOp` node: returns
+`(output_idx_symbols, ranges_dict, shape)` where `output_idx_symbols` is a
+vector of the symbolic output indices (`Int` slots are dropped), `ranges_dict`
+maps each output index symbol to its iteration range, and `shape` is the
+ArrayOp's declared shape.
+
+This is the MTKBase-level canonical definition. `ModelingToolkitTearing`
+re-exports it so tearing code can call it unqualified.
+"""
+function _get_arrayop_index_info(ao)
     @match ao begin
-        SU.BSImpl.ArrayOp(; output_idx, ranges, shape = sh) => begin
+        BSImpl.ArrayOp(; output_idx, ranges, shape = sh) => begin
             sym_idxs = [(dim_i, ii) for (dim_i, ii) in enumerate(output_idx) if !(ii isa Int)]
-            return [ii for (_, ii) in sym_idxs], ranges, sh
+            return SymbolicT[ii for (_, ii) in sym_idxs], ranges, sh
         end
         _ => return SymbolicT[], Dict{SymbolicT, StepRange{Int,Int}}(), UnitRange{Int}[]
     end
@@ -183,11 +199,11 @@ function _build_block_observed_lookup(block_eqs_meta, sys)
         base_var = arguments(rep_lhs)[1]
 
         # Extract representative index values and iteration ranges from original ArrayOp
-        ao = _find_arrayop_local(unwrap(block.original_eq.lhs))
-        ao === nothing && (ao = _find_arrayop_local(unwrap(block.original_eq.rhs)))
+        ao = _find_arrayop(unwrap(block.original_eq.lhs))
+        ao === nothing && (ao = _find_arrayop(unwrap(block.original_eq.rhs)))
         ao === nothing && continue
 
-        output_idx, ranges, sh = _get_arrayop_index_info_local(ao)
+        output_idx, ranges, sh = _get_arrayop_index_info(ao)
         isempty(output_idx) && continue
 
         rep_idx_vals = Int[]
@@ -370,10 +386,10 @@ function _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
         rep_pos === nothing && continue
 
         # Get the ArrayOp's iteration info for this block
-        ao = _find_arrayop_local(unwrap(block.original_eq.lhs))
-        ao === nothing && (ao = _find_arrayop_local(unwrap(block.original_eq.rhs)))
+        ao = _find_arrayop(unwrap(block.original_eq.lhs))
+        ao === nothing && (ao = _find_arrayop(unwrap(block.original_eq.rhs)))
         ao === nothing && continue
-        output_idx, ranges, sh = _get_arrayop_index_info_local(ao)
+        output_idx, ranges, sh = _get_arrayop_index_info(ao)
         isempty(output_idx) && continue
 
         # Get per-dimension iteration ranges
