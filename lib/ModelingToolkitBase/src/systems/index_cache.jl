@@ -353,6 +353,11 @@ function get_observed_and_dependent_to_timeseries(
     )
     dependent_pars_to_timeseries = Dict{SymbolicT, TimeseriesSetType}()
     observed_syms_to_timeseries = Dict{SymbolicT, TimeseriesSetType}()
+    # Block-observed variables (eliminated algebraic blocks from ArrayOp tearing)
+    # are not in `observed(sys)` — they are resolved on-demand from representative
+    # equations. Register their base arrays here so that `_all_ts_idxs!` can find
+    # them via the same cache lookup used for ordinary observed variables.
+    _register_block_observed_base_timeseries!(observed_syms_to_timeseries, sys)
     if !is_time_dependent(sys)
         for eq in observed(sys)
             sym = eq.lhs

@@ -348,15 +348,20 @@ for traitT in [
                 # DDEs case, to detect x(t - k)
                 push!(ts_idxs, ContinuousTimeseries())
             else
-                # Block-observed variables (from block tearing) are not in the
-                # index cache — check them before falling through to the cache lookup.
-                block_eqs_meta = SU.getmetadata(sys, BlockEquationsKey, nothing)
-                if block_eqs_meta !== nothing && !isempty(block_eqs_meta) &&
-                   _resolve_block_observed_expr(sys, s, block_eqs_meta) !== nothing
-                    push!(ts_idxs, ContinuousTimeseries())
-                elseif has_index_cache(sys) && (ic = get_index_cache(sys)) !== nothing
+                if has_index_cache(sys) && (ic = get_index_cache(sys)) !== nothing
+                    # Check both `s` directly and its base array (via split_indexed_var).
+                    # Ordinary observed equations register under `s`; block-observed
+                    # base arrays (from ArrayOp tearing) register under the base so
+                    # one entry covers every `v[i]` in the block. Empty `ts` sets are
+                    # block-observed markers meaning "continuous time".
+                    arrv_s, _ = split_indexed_var(s)
                     if (ts = get(ic.observed_syms_to_timeseries, s, nothing)) !== nothing
                         union!(ts_idxs, ts)
+                        isempty(ts) && push!(ts_idxs, ContinuousTimeseries())
+                    elseif (ts = get(ic.observed_syms_to_timeseries, arrv_s, nothing)) !==
+                            nothing
+                        union!(ts_idxs, ts)
+                        isempty(ts) && push!(ts_idxs, ContinuousTimeseries())
                     elseif (ts = get(ic.dependent_pars_to_timeseries, s, nothing)) !==
                             nothing
                         union!(ts_idxs, ts)

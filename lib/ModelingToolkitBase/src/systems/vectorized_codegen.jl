@@ -138,6 +138,35 @@ function _resolve_block_observed_expr(sys, sym, block_eqs_meta)
     return nothing
 end
 
+"""
+    _register_block_observed_base_timeseries!(dict, sys)
+
+Register the base array of each eliminated block (e.g. `v(t)` when `v[i]` has
+been eliminated algebraically) in `dict` with an empty `TimeseriesSetType()`.
+This is used to populate `IndexCache.observed_syms_to_timeseries` so that
+`_all_ts_idxs!` can recognize block-observed variables as continuous-timeseries
+via the same lookup path used for ordinary observed variables.
+
+Only the base array (and its namespaced variant) is registered, not every
+`v[i]` element — callers must fall back to the base key via `split_indexed_var`
+when looking up a specific element. This keeps the cache O(M_block) instead
+of O(N) in the grid size.
+"""
+function _register_block_observed_base_timeseries!(dict, sys)
+    elim_blocks = getmetadata(sys, EliminatedBlockEquationsKey, nothing)
+    elim_blocks === nothing && return dict
+    for block in elim_blocks
+        rep = block.representative_eq
+        rep_lhs = unwrap(rep.lhs)
+        SU._iszero(rep_lhs) && continue
+        SU.iscall(rep_lhs) && operation(rep_lhs) === getindex || continue
+        base_var = arguments(rep_lhs)[1]
+        dict[base_var] = TimeseriesSetType()
+        dict[renamespace(sys, base_var)] = TimeseriesSetType()
+    end
+    return dict
+end
+
 """Build lookup from base variable to block info for eliminated observed blocks.
 Stores both namespaced and un-namespaced keys to handle compiled.v[i] access."""
 function _build_block_observed_lookup(block_eqs_meta, sys)
