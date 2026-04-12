@@ -13,15 +13,14 @@ struct BlockEquationsKey end
 struct EliminatedBlockEquationsKey end
 
 import Moshi.Match: @match
-import SymbolicUtils as _SU_VC
 using Symbolics: SymbolicT
 
 """Find the first ArrayOp in an expression, looking inside D() wrappers. (Local copy for MTKBase.)"""
 function _find_arrayop_local(expr)
     expr isa SymbolicT || return nothing
     @match expr begin
-        _SU_VC.BSImpl.ArrayOp(;) => return expr
-        _SU_VC.BSImpl.Term(; f, args) => begin
+        SU.BSImpl.ArrayOp(;) => return expr
+        SU.BSImpl.Term(; f, args) => begin
             for arg in args
                 ao = _find_arrayop_local(arg)
                 ao !== nothing && return ao
@@ -35,29 +34,12 @@ end
 """Extract output_idx symbols, ranges dict, and shape from an ArrayOp. (Local copy for MTKBase.)"""
 function _get_arrayop_index_info_local(ao)
     @match ao begin
-        _SU_VC.BSImpl.ArrayOp(; output_idx, ranges, shape = sh) => begin
+        SU.BSImpl.ArrayOp(; output_idx, ranges, shape = sh) => begin
             sym_idxs = [(dim_i, ii) for (dim_i, ii) in enumerate(output_idx) if !(ii isa Int)]
             return [ii for (_, ii) in sym_idxs], ranges, sh
         end
         _ => return SymbolicT[], Dict{SymbolicT, StepRange{Int,Int}}(), UnitRange{Int}[]
     end
-end
-
-"""
-Check if any block equation has multiple output dimensions (2D+ ArrayOp).
-"""
-function _has_multidim_blocks(block_eqs_meta)
-    for (key, block) in block_eqs_meta
-        block.eliminated && continue
-        ao = _find_arrayop_local(unwrap(block.original_eq.lhs))
-        if ao === nothing
-            ao = _find_arrayop_local(unwrap(block.original_eq.rhs))
-        end
-        ao === nothing && continue
-        output_idx, _, _ = _get_arrayop_index_info_local(ao)
-        length(output_idx) > 1 && return true
-    end
-    return false
 end
 
 """
@@ -103,7 +85,9 @@ function _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
         block = get(block_eqs_meta, i, nothing)
         block === nothing && continue
         isdiffeq(block.representative_eq) || continue
-        # Inline all observed into this block representative RHS
+        # Inline all observed into this block representative RHS.
+        # maxiters=100: observed chains are typically shallow (1-3 levels for
+        # algebraic elimination), but we allow headroom for deeply nested cases.
         new_rhss[i] = Symbolics.fixpoint_sub(unwrap(rhs), obs_dict; maxiters=100)
     end
     return new_rhss
@@ -164,8 +148,9 @@ end
 """Build lookup from base variable to block info for eliminated observed blocks.
 Stores both namespaced and un-namespaced keys to handle compiled.v[i] access."""
 function _build_block_observed_lookup(block_eqs_meta, sys)
+    BlockObsInfo = Tuple{Any, Vector{Int}, Vector, SymbolicT}
+    lookup = Dict{SymbolicT, BlockObsInfo}()
     elim_blocks = getmetadata(sys, EliminatedBlockEquationsKey, nothing)
-    lookup = Dict{Any, Tuple}()
     elim_blocks === nothing && return lookup
     for block in elim_blocks
         rep = block.representative_eq
@@ -211,6 +196,12 @@ For scalar (non-block) equations, sparsity is computed via `Symbolics.jacobian_s
 
 Uses `_build_block_outputidxs` for consistent equation→du row mapping (same mapping
 used by `generate_rhs` for code generation).
+
+!!! note
+    This assumes a spatially uniform stencil — every element in a block has the same
+    dependency offsets as the representative. This is correct for standard finite
+    difference discretizations on uniform grids but would be wrong for spatially-varying
+    stencils or non-uniform grids.
 """
 function _block_jacobian_sparsity(sys, block_eqs)
     N = length(unknowns(sys))
@@ -220,8 +211,8 @@ function _block_jacobian_sparsity(sys, block_eqs)
     # Get the consistent equation→du row mapping
     outputidxs = _build_block_outputidxs(eqs, sys)
 
-    I = Int[]
-    J = Int[]
+    row_idxs = Int[]
+    col_idxs = Int[]
 
     for (i, eq) in enumerate(eqs)
         row = outputidxs[i]
@@ -247,8 +238,8 @@ function _block_jacobian_sparsity(sys, block_eqs)
                 for offset in offsets
                     col = tile_row + offset
                     if 1 <= col <= N
-                        push!(I, tile_row)
-                        push!(J, col)
+                        push!(row_idxs, tile_row)
+                        push!(col_idxs, col)
                     end
                 end
             end
@@ -257,13 +248,13 @@ function _block_jacobian_sparsity(sys, block_eqs)
             scalar_sp = Symbolics.jacobian_sparsity([unwrap(eq.rhs)], dvs)
             _, cols, _ = SparseArrays.findnz(scalar_sp)
             for col in cols
-                push!(I, row)
-                push!(J, col)
+                push!(row_idxs, row)
+                push!(col_idxs, col)
             end
         end
     end
 
-    return SparseArrays.sparse(I, J, true, N, N)
+    return SparseArrays.sparse(row_idxs, col_idxs, true, N, N)
 end
 
 """
@@ -283,8 +274,10 @@ function _build_block_outputidxs(eqs, sys)
             pos = variable_index(sys, inner)
             push!(outputidxs, pos)
         elseif _iszero(lhs)
-            # Algebraic equation 0 ~ rhs — shouldn't appear in block systems
-            # but handle gracefully
+            # Algebraic equation 0 ~ rhs — block systems should not have these
+            # (algebraic blocks are eliminated during tearing). Fall back to
+            # sequential indexing as a safe default.
+            @warn "Unexpected algebraic equation (0 ~ rhs) in block system at position $(length(outputidxs)+1)"
             push!(outputidxs, length(outputidxs) + 1)
         else
             # v(t)[k] ~ rhs — variable_index of v(t)[k]
@@ -293,76 +286,6 @@ function _build_block_outputidxs(eqs, sys)
         end
     end
     return outputidxs
-end
-
-"""
-    _expand_rhss_for_codegen(rhss, eqs, sys, block_eqs)
-
-Expand M representative RHS expressions to N scalar RHS expressions for code generation.
-This is done at codegen time (not during mtkcompile) to keep the structural analysis O(1).
-The expansion is pure index-shifting on symbolic expressions — fast O(N) with no
-structural analysis or tearing.
-
-Returns `(expanded_rhss, expanded_eqs)`.
-"""
-function _expand_rhss_for_codegen(rhss, eqs, sys, block_eqs)
-    new_rhss = SymbolicT[]
-    new_eqs = Equation[]
-
-    for (i, (rhs_val, eq)) in enumerate(zip(rhss, eqs))
-        # Check if this equation is a block representative
-        block = get(block_eqs, i, nothing)
-        if block === nothing || !isa(block, Any) || (block isa Pair ? block.first : 0) < 0
-            # Regular scalar equation — keep as-is
-            push!(new_rhss, rhs_val)
-            push!(new_eqs, eq)
-            continue
-        end
-
-        # Block equation — expand to N scalar equations
-        ao = _find_arrayop_local(unwrap(block.original_eq.lhs))
-        if ao === nothing
-            ao = _find_arrayop_local(unwrap(block.original_eq.rhs))
-        end
-        if ao === nothing
-            push!(new_rhss, rhs_val)
-            push!(new_eqs, eq)
-            continue
-        end
-
-        output_idx, ranges, sh = _get_arrayop_index_info_local(ao)
-        isempty(output_idx) && (push!(new_rhss, rhs_val); push!(new_eqs, eq); continue)
-
-        # Get representative's base indices
-        rep_idx_vals = Int[]
-        for (dim_i, ii) in enumerate(output_idx)
-            if haskey(ranges, ii)
-                push!(rep_idx_vals, first(ranges[ii]))
-            else
-                push!(rep_idx_vals, first(sh[dim_i]))
-            end
-        end
-
-        iter_ranges = [haskey(ranges, ii) ? ranges[ii] : sh[dim_i]
-                       for (dim_i, ii) in enumerate(output_idx)]
-
-        # For each point in the iteration space, shift the RHS and LHS
-        lhs_uw = unwrap(eq.lhs)
-        rhs_uw = unwrap(rhs_val)
-        for idx_tuple in Iterators.product(iter_ranges...)
-            shifts = [idx_tuple[d] - rep_idx_vals[d] for d in eachindex(output_idx)]
-            if all(iszero, shifts)
-                push!(new_rhss, rhs_val)
-                push!(new_eqs, eq)
-            else
-                new_lhs = _shift_array_indices_multidim_sym(lhs_uw, shifts)
-                new_rhs = _shift_array_indices_multidim_sym(rhs_uw, shifts)
-                push!(new_rhss, new_rhs)
-                push!(new_eqs, new_lhs ~ new_rhs)
-            end
-        end
-    end
-    return new_rhss, new_eqs
 end
 
 """
@@ -436,12 +359,12 @@ function _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
 
         # Get per-dimension base indices from the representative variable
         base_idxs = Int[]
-        if _SU_VC.iscall(rep_var) && operation(rep_var) === getindex
+        if SU.iscall(rep_var) && operation(rep_var) === getindex
             rep_args = arguments(rep_var)
             for k in 2:length(rep_args)
                 idx_arg = rep_args[k]
-                if _SU_VC.isconst(idx_arg)
-                    push!(base_idxs, Int(_SU_VC.unwrap_const(idx_arg)))
+                if SU.isconst(idx_arg)
+                    push!(base_idxs, Int(SU.unwrap_const(idx_arg)))
                 else
                     push!(base_idxs, k <= length(iter_ranges) ? first(iter_ranges[k-1]) : 1)
                 end
@@ -491,8 +414,8 @@ function _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
 
             if bi.ndims == 1
                 # 1D block: single ForLoop
-                loop_var = _SU_VC.Sym{_SU_VC.SymReal}(Symbol("__blk_k_$(bi.eq_idx)");
-                    type = Int, shape = _SU_VC.ShapeVecT())
+                loop_var = SU.Sym{SU.SymReal}(Symbol("__blk_k_$(bi.eq_idx)");
+                    type = Int, shape = SU.ShapeVecT())
                 param_rhs = _parameterize_symbolic_rhs(rep_rhs, bi.base_idxs[1], loop_var)
                 du_offset = bi.rep_pos - bi.base_idxs[1]
                 du_idx = du_offset == 0 ? loop_var : loop_var + du_offset
@@ -501,8 +424,8 @@ function _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
             else
                 # Multi-dimensional block: nested ForLoops
                 # Create per-dimension loop variables
-                loop_vars = [_SU_VC.Sym{_SU_VC.SymReal}(
-                    Symbol("__blk_$(d)_$(bi.eq_idx)"); type = Int, shape = _SU_VC.ShapeVecT())
+                loop_vars = [SU.Sym{SU.SymReal}(
+                    Symbol("__blk_$(d)_$(bi.eq_idx)"); type = Int, shape = SU.ShapeVecT())
                     for d in 1:bi.ndims]
 
                 # Parameterize RHS with multi-dimensional loop variables
@@ -566,12 +489,10 @@ end
     _parameterize_symbolic_rhs(expr, base_idx, loop_var)
 
 Replace all concrete-integer `getindex(arr, Const(int))` in a symbolic expression
-with parameterized loop-variable expressions. Converts the symbolic RHS to a Julia
-Expr via `toexpr`, then parameterizes integer array indices at the Expr level.
-Returns a `LiteralExpr` wrapping the parameterized Expr.
+with parameterized loop-variable expressions: `getindex(arr, loop_var + offset)`.
 
-This approach avoids symbolic `getindex` type issues by operating at the Expr level
-after `toexpr` has resolved all variable name mappings.
+Only handles 1D getindex (single index dimension). For multi-dimensional blocks,
+use `_parameterize_symbolic_rhs_multidim` instead.
 """
 function _parameterize_symbolic_rhs(expr, base_idx::Int, loop_var)
     # The expr is symbolic. We need to parameterize it.
@@ -582,7 +503,7 @@ function _parameterize_symbolic_rhs(expr, base_idx::Int, loop_var)
     isempty(sub_dict) && return expr
     # Apply substitution with allow-all filter to penetrate Differential
     allow_all = (_) -> true
-    sub = _SU_VC.Substituter{false}(sub_dict, allow_all)
+    sub = SU.Substituter{false}(sub_dict, allow_all)
     return sub(expr)
 end
 
@@ -591,19 +512,19 @@ Collect getindex substitution rules, building replacements with `term()` directl
 """
 function _collect_symbolic_getindex_subs!(sub_dict, expr, base_idx, loop_var)
     expr isa SymbolicT || return
-    _SU_VC.iscall(expr) || return
+    SU.iscall(expr) || return
     f = operation(expr)
     args = arguments(expr)
     if f === getindex && length(args) >= 2
         idx = args[2]
-        if _SU_VC.isconst(idx)
-            val = Int(_SU_VC.unwrap_const(idx))
+        if SU.isconst(idx)
+            val = Int(SU.unwrap_const(idx))
             offset = val - base_idx
             new_idx = offset == 0 ? loop_var : loop_var + offset
             # Build replacement using term() with explicit type/shape
-            expr_type = _SU_VC.symtype(expr)
-            replacement = _SU_VC.term(getindex, args[1], new_idx;
-                type = expr_type, shape = _SU_VC.ShapeVecT())
+            expr_type = SU.symtype(expr)
+            replacement = SU.term(getindex, args[1], new_idx;
+                type = expr_type, shape = SU.ShapeVecT())
             sub_dict[expr] = replacement
             return  # Don't recurse
         end
@@ -624,7 +545,7 @@ function _parameterize_symbolic_rhs_multidim(expr, base_idxs::Vector{Int}, loop_
     _collect_symbolic_getindex_subs_multidim!(sub_dict, expr, base_idxs, loop_vars)
     isempty(sub_dict) && return expr
     allow_all = (_) -> true
-    sub = _SU_VC.Substituter{false}(sub_dict, allow_all)
+    sub = SU.Substituter{false}(sub_dict, allow_all)
     return sub(expr)
 end
 
@@ -635,26 +556,26 @@ loop variables: getindex(arr, lv1 + (i1-base1), lv2 + (i2-base2), ...).
 """
 function _collect_symbolic_getindex_subs_multidim!(sub_dict, expr, base_idxs, loop_vars)
     expr isa SymbolicT || return
-    _SU_VC.iscall(expr) || return
+    SU.iscall(expr) || return
     f = operation(expr)
     args = arguments(expr)
     if f === getindex && length(args) >= 2
         n_idx = length(args) - 1
         # Check if all indices are concrete integers
         all_const = all(2:length(args)) do k
-            _SU_VC.isconst(args[k])
+            SU.isconst(args[k])
         end
         if all_const && n_idx == length(base_idxs) && n_idx == length(loop_vars)
             new_idx_args = Any[]
             for d in 1:n_idx
-                val = Int(_SU_VC.unwrap_const(args[d+1]))
+                val = Int(SU.unwrap_const(args[d+1]))
                 offset = val - base_idxs[d]
                 new_idx = offset == 0 ? loop_vars[d] : loop_vars[d] + offset
                 push!(new_idx_args, new_idx)
             end
-            expr_type = _SU_VC.symtype(expr)
-            replacement = _SU_VC.term(getindex, args[1], new_idx_args...;
-                type = expr_type, shape = _SU_VC.ShapeVecT())
+            expr_type = SU.symtype(expr)
+            replacement = SU.term(getindex, args[1], new_idx_args...;
+                type = expr_type, shape = SU.ShapeVecT())
             sub_dict[expr] = replacement
             return  # Don't recurse into matched getindex
         end
@@ -686,10 +607,4 @@ function _replace_setarray_body(outer, target_let, replacement)
     end
     return Let(outer.pairs, replacement, outer.let_block)
 end
-
-# Legacy Expr-level function — no longer called, kept for API compat:
-function vectorize_iip_expr!(iip_expr, sys, block_eqs)
-    return iip_expr  # No-op
-end
-
 
