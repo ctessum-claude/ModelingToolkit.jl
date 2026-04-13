@@ -51,11 +51,43 @@ re-exports it so tearing code can call it unqualified.
 function _get_arrayop_index_info(ao)
     @match ao begin
         BSImpl.ArrayOp(; output_idx, ranges, shape = sh) => begin
-            sym_idxs = [(dim_i, ii) for (dim_i, ii) in enumerate(output_idx) if !(ii isa Int)]
-            return SymbolicT[ii for (_, ii) in sym_idxs], ranges, sh
+            syms = SymbolicT[ii for ii in output_idx if !(ii isa Int)]
+            return syms, ranges, sh
         end
-        _ => return SymbolicT[], Dict{SymbolicT, StepRange{Int,Int}}(), UnitRange{Int}[]
+        _ => return SymbolicT[],
+                    Dict{SymbolicT, StepRange{Int,Int}}(),
+                    SU.ShapeVecT()
     end
+end
+
+"""
+    _extract_block_iteration(block)
+
+Given an `ArrayBlockInfo`, return `(rep_idx_vals, iter_ranges)` where
+`rep_idx_vals::Vector{Int}` is the representative's concrete index in each
+symbolic dimension, and `iter_ranges::Vector{StepRange{Int,Int}}` is the
+iteration range for each dimension. Normalizing to `StepRange{Int,Int}`
+gives both call sites (`_build_block_observed_lookup` and
+`_make_block_forloop_wrap_code`) a single concrete element type.
+
+Returns `nothing` if the block does not carry an ArrayOp LHS/RHS or has no
+symbolic output indices.
+"""
+function _extract_block_iteration(block)
+    ao = _find_arrayop(unwrap(block.original_eq.lhs))
+    ao === nothing && (ao = _find_arrayop(unwrap(block.original_eq.rhs)))
+    ao === nothing && return nothing
+    output_idx, ranges, sh = _get_arrayop_index_info(ao)
+    isempty(output_idx) && return nothing
+
+    rep_idx_vals = Int[]
+    iter_ranges = StepRange{Int, Int}[]
+    for (dim_i, ii) in enumerate(output_idx)
+        r = haskey(ranges, ii) ? ranges[ii] : first(sh[dim_i]):1:last(sh[dim_i])
+        push!(rep_idx_vals, first(r))
+        push!(iter_ranges, r)
+    end
+    return rep_idx_vals, iter_ranges
 end
 
 """
@@ -71,11 +103,13 @@ Only block representative RHSs are modified. Scalar equation RHSs are unchanged
 function _inline_block_observed_into_rhss(rhss, eqs, sys, block_eqs_meta)
     # Build substitution dict from TWO sources:
     # 1. Scalar observed equations in sys.observed — reuse `get_substitutions`,
-    #    which already flattens observed-to-observed references.
+    #    which already flattens observed-to-observed references and returns
+    #    a `Dict{SymbolicT, SymbolicT}`.
     # 2. Block algebraic representatives from eliminated_block_eqs — a single
-    #    entry per block; the parameterized ForLoop shifts indices automatically.
+    #    entry per block (with `unwrap(rep.rhs)::SymbolicT`); the parameterized
+    #    ForLoop shifts indices automatically.
     # This is O(M) total, NOT O(N).
-    obs_dict = Dict{SymbolicT, Any}(get_substitutions(sys))
+    obs_dict = copy(get_substitutions(sys))  # Dict{SymbolicT, SymbolicT}
 
     elim_blocks = getmetadata(sys, EliminatedBlockEquationsKey, nothing)
     if elim_blocks !== nothing
@@ -184,9 +218,15 @@ function _register_block_observed_base_timeseries!(dict, sys)
 end
 
 """Build lookup from base variable to block info for eliminated observed blocks.
-Stores both namespaced and un-namespaced keys to handle compiled.v[i] access."""
+Stores both namespaced and un-namespaced keys to handle compiled.v[i] access.
+
+The value type uses `Any` for the block field because `ArrayBlockInfo` is
+defined in `ModelingToolkitTearing` and MTKBase sits below MTKTearing in the
+dep graph — it can't name the concrete type. All other fields are tight.
+"""
+const BlockObsInfo = Tuple{Any, Vector{Int}, Vector{StepRange{Int, Int}}, SymbolicT}
+
 function _build_block_observed_lookup(block_eqs_meta, sys)
-    BlockObsInfo = Tuple{Any, Vector{Int}, Vector, SymbolicT}
     lookup = Dict{SymbolicT, BlockObsInfo}()
     elim_blocks = getmetadata(sys, EliminatedBlockEquationsKey, nothing)
     elim_blocks === nothing && return lookup
@@ -198,21 +238,9 @@ function _build_block_observed_lookup(block_eqs_meta, sys)
         SU.iscall(rep_lhs) && operation(rep_lhs) === getindex || continue
         base_var = arguments(rep_lhs)[1]
 
-        # Extract representative index values and iteration ranges from original ArrayOp
-        ao = _find_arrayop(unwrap(block.original_eq.lhs))
-        ao === nothing && (ao = _find_arrayop(unwrap(block.original_eq.rhs)))
-        ao === nothing && continue
-
-        output_idx, ranges, sh = _get_arrayop_index_info(ao)
-        isempty(output_idx) && continue
-
-        rep_idx_vals = Int[]
-        for (dim_i, ii) in enumerate(output_idx)
-            push!(rep_idx_vals, haskey(ranges, ii) ? first(ranges[ii]) : first(sh[dim_i]))
-        end
-
-        iter_ranges = [haskey(ranges, ii) ? ranges[ii] : sh[dim_i]
-                       for (dim_i, ii) in enumerate(output_idx)]
+        iter = _extract_block_iteration(block)
+        iter === nothing && continue
+        rep_idx_vals, iter_ranges = iter
 
         info = (block, rep_idx_vals, iter_ranges, base_var)
         lookup[base_var] = info
@@ -310,6 +338,8 @@ function _build_block_outputidxs(eqs, sys)
             # D(u(t)[k]) → variable_index(sys, u(t)[k])
             inner = arguments(lhs)[1]
             pos = variable_index(sys, inner)
+            pos isa Int ||
+                error("variable_index(sys, $inner) returned $(pos), expected Int")
             push!(outputidxs, pos)
         elseif _iszero(lhs)
             # Algebraic equation 0 ~ rhs — block systems should not have these
@@ -322,6 +352,8 @@ function _build_block_outputidxs(eqs, sys)
         else
             # v(t)[k] ~ rhs — variable_index of v(t)[k]
             pos = variable_index(sys, lhs)
+            pos isa Int ||
+                error("variable_index(sys, $lhs) returned $(pos), expected Int")
             push!(outputidxs, pos)
         end
     end
@@ -363,7 +395,27 @@ end
 # IR-Level ForLoop Generation
 # ============================================================================
 
-using SymbolicUtils.Code: ForLoop, SetArray, AtIndex, Let, Func, Assignment
+using SymbolicUtils.Code: ForLoop, SetArray, AtIndex, Let, Func, Assignment, DestructuredArgs
+
+"""
+Element type of `Let.pairs` in the `SymbolicUtils.Code` IR. Using this as
+the declared type of `inner_pairs` in `_rewrite_setarray_for_blocks` matches
+the `Let` struct's field type exactly and avoids a convert-and-copy at the
+struct constructor boundary.
+"""
+const LetPairT = Union{Assignment, DestructuredArgs}
+
+"""
+Concrete NamedTuple type for the per-block metadata cached by
+`_make_block_forloop_wrap_code`. Using a concrete type (rather than
+`Vector{Any}`) lets Julia specialize the `iip_transform` closure that
+captures this list, and narrows every field access inside
+`_rewrite_setarray_for_blocks` from `ANY` to a concrete type.
+"""
+const BlockInfoNT = NamedTuple{
+    (:eq_idx, :du_range, :rep_pos, :base_idxs, :iter_ranges, :ndims),
+    Tuple{Int, UnitRange{Int}, Int, Vector{Int}, Vector{StepRange{Int, Int}}, Int}
+}
 
 """
     _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
@@ -376,25 +428,22 @@ Returns a function `iip_transform(func::Func) -> Func`.
 """
 function _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
     # Pre-compute block metadata for both 1D and multi-dimensional blocks
-    block_info_list = []
+    block_info_list = BlockInfoNT[]
     for (eq_idx, block) in block_eqs_meta
         eq_idx < 0 && continue
         isdiffeq(block.representative_eq) || continue
         rep_lhs = unwrap(block.representative_eq.lhs)
         rep_var = arguments(rep_lhs)[1]  # u(t)[k] or u(t)[i,j]
         rep_pos = variable_index(sys, rep_var)
-        rep_pos === nothing && continue
+        # `variable_index` has a type-unstable fallback (returns `false` for
+        # unknown dispatches, per index_cache.jl:511). Narrow to `Int` here so
+        # all downstream uses see a concrete type.
+        rep_pos isa Int || continue
+        rp::Int = rep_pos
 
-        # Get the ArrayOp's iteration info for this block
-        ao = _find_arrayop(unwrap(block.original_eq.lhs))
-        ao === nothing && (ao = _find_arrayop(unwrap(block.original_eq.rhs)))
-        ao === nothing && continue
-        output_idx, ranges, sh = _get_arrayop_index_info(ao)
-        isempty(output_idx) && continue
-
-        # Get per-dimension iteration ranges
-        iter_ranges = [haskey(ranges, ii) ? ranges[ii] : sh[dim_i]
-                       for (dim_i, ii) in enumerate(output_idx)]
+        iter = _extract_block_iteration(block)
+        iter === nothing && continue
+        _, iter_ranges = iter
 
         # Get per-dimension base indices from the representative variable
         base_idxs = Int[]
@@ -409,14 +458,15 @@ function _make_block_forloop_wrap_code(block_eqs_meta, sys, eqs)
                 end
             end
         else
-            base_idxs = [rep_pos]
+            base_idxs = [rp]
         end
 
-        du_range = rep_pos:(rep_pos + block.scalar_count - 1)
-        ndims = length(output_idx)
+        du_range = rp:(rp + block.scalar_count - 1)
+        ndims = length(iter_ranges)
 
-        push!(block_info_list, (eq_idx=eq_idx, du_range=du_range, rep_pos=rep_pos,
-            base_idxs=base_idxs, iter_ranges=iter_ranges, ndims=ndims))
+        push!(block_info_list, (eq_idx = Int(eq_idx), du_range = du_range,
+            rep_pos = rp, base_idxs = base_idxs, iter_ranges = iter_ranges,
+            ndims = ndims))
     end
 
     function iip_transform(func::Func)
@@ -475,7 +525,7 @@ function _rewrite_setarray_for_blocks(set_array::SetArray, block_info_list)
     end
 
     # Build ForLoops for each block.
-    forloops = []
+    forloops = ForLoop[]
     for bi in block_info_list
         rep_rhs = get(rep_rhs_map, bi.rep_pos, nothing)
         rep_rhs === nothing && continue
@@ -511,9 +561,11 @@ function _rewrite_setarray_for_blocks(set_array::SetArray, block_info_list)
 
     # Rebuild the SetArray site: scalar SetArray first, then each ForLoop, then
     # return arr_sym. Each step is wrapped in a Let Assignment so toexpr emits
-    # them as a sequence.
+    # them as a sequence. Use `LetPairT` (= `Union{Assignment, DestructuredArgs}`,
+    # the declared element type of `Let.pairs`) to match the struct field
+    # exactly and avoid a convert-and-copy at the Let constructor boundary.
     new_scalar_set = SetArray(set_array.inbounds, arr_sym, scalar_entries, false)
-    inner_pairs = Union{Assignment, Any}[Assignment(Symbol("##scalar_out##"), new_scalar_set)]
+    inner_pairs = LetPairT[Assignment(Symbol("##scalar_out##"), new_scalar_set)]
     for (fi, fl) in enumerate(forloops)
         push!(inner_pairs, Assignment(Symbol("##loop_$(fi)##"), fl))
     end
@@ -572,16 +624,19 @@ function _compute_strides(iter_ranges)
 end
 
 """Build a symbolic linear index expression from multi-dim loop variables."""
-function _build_linear_index_expr(loop_vars, base_idxs, strides, rep_pos)
+function _build_linear_index_expr(loop_vars::Vector, base_idxs::Vector{Int},
+        strides::Vector{Int}, rep_pos::Int)
     # linear = rep_pos + sum((loop_var_d - base_idx_d) * stride_d for d in dims)
-    expr = rep_pos
+    #
+    # `expr` must be SymbolicT from the first iteration; initializing with
+    # `rep_pos::Int` and relying on Julia to widen to SymbolicT produces a
+    # type-unstable accumulator (the Union{Int, SymbolicT} shows up in the
+    # generated function's inferred type). Promote up front by adding
+    # `zero(loop_vars[1])`, which is a SymbolicT.
+    expr::SymbolicT = rep_pos + zero(loop_vars[1])
     for d in eachindex(loop_vars)
         offset_d = loop_vars[d] - base_idxs[d]
-        if strides[d] == 1
-            expr = expr + offset_d
-        else
-            expr = expr + offset_d * strides[d]
-        end
+        expr = strides[d] == 1 ? (expr + offset_d) : (expr + offset_d * strides[d])
     end
     return expr
 end
