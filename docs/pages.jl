@@ -32,6 +32,7 @@ pages = [
         "Advanced Examples" => Any[
             "examples/tearing_parallelism.md",
             "examples/sparse_jacobians.md",
+            "examples/arrayop_block_tearing.md",
             "examples/perturbation.md",
         ],
     ],

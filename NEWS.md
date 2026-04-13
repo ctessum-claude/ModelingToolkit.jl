@@ -1,5 +1,30 @@
 # ModelingToolkit v11 Release Notes
 
+## ArrayOp block tearing for PDE-discretized systems
+
+Equations wrapped in `@arrayop` — i.e. equations indexed by a symbolic variable
+ranging over a grid — now go through a specialized *block tearing* path in
+`mtkcompile`. Structural analysis (tearing, alias elimination, Jacobian sparsity
+detection) operates on a single representative scalar equation per block, and
+code generation emits one `ForLoop` per block rather than `N` scalar assignments.
+The resulting `mtkcompile` and `ODEProblem` construction are `O(M)` in the number
+of blocks instead of `O(N)` in the grid size, turning minutes of Julia
+compilation into seconds for large PDE discretizations. Jacobian sparsity is
+also computed from the representative's stencil and tiled across the block,
+producing the correct banded pattern with `O(N)` nonzeros instead of a dense
+`N × N` shape.
+
+Algebraic blocks that appear as simple assignments (e.g. `flux[i] ~ f(u[i-1], u[i])`)
+are pre-substituted into dependent ODE blocks during tearing and stored as
+block-observed variables. They don't appear in the compiled unknowns but can
+still be accessed after solving, either as a whole array (`sol[compiled.flux]`)
+or by index (`sol[compiled.flux[i]]`).
+
+`MethodOfLines.jl` uses `@arrayop` as its lowering target for the
+`ArrayDiscretization()` strategy, so user-facing PDE systems discretized via
+`MOLFiniteDifference` benefit automatically. See the "ArrayOp block tearing"
+tutorial under Advanced Examples for a worked 1D diffusion PDE.
+
 ## Symbolics@7 and SymbolicUtils@4 compatibility
 
 SymbolicUtils version 4 involved a major overhaul of the core symbolic infrastructure, which

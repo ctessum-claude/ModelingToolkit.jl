@@ -11,6 +11,25 @@ Does not rely on metadata to identify variables/parameters/brownians. Instead, q
 the system for which symbolic quantites belong to which category. Any variables not
 present in the equations of the system will be removed in this process.
 
+# ArrayOp block tearing
+
+Equations wrapped in the [`@arrayop`](@ref) macro — i.e. equations with a symbolic
+index variable ranging over a grid, such as `D(u[i]) ~ u[i-1] - 2u[i] + u[i+1]` for
+`i in 2:(N-1)` — are handled by a specialized *block tearing* path. Structural
+analysis (tearing, alias elimination, Jacobian sparsity detection) operates on a
+single representative scalar equation per block, and code generation emits one
+`ForLoop` per block rather than unrolling `N` scalar assignments. The resulting
+`mtkcompile` and `ODEProblem` construction are `O(M)` in the number of blocks
+instead of `O(N)` in the grid size, which is essential for PDE-discretized systems
+where `N` can be in the thousands or more.
+
+Algebraic blocks that appear as simple assignments (e.g. `flux[i] ~ f(u[i-1], u[i])`)
+are pre-substituted into dependent ODE blocks during tearing and stored as
+block-observed variables. They don't appear in the compiled unknowns but can still
+be accessed after solving, either as a whole array (`sol[compiled.flux]`) or by
+index (`sol[compiled.flux[i]]`). See the "ArrayOp block tearing" tutorial under
+Advanced Examples for a worked 1D diffusion PDE.
+
 # Keyword Arguments
 
 + When `simplify=true`, the `simplify` function will be applied during the tearing process.
