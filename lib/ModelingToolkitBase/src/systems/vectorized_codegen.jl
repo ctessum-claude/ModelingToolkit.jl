@@ -16,6 +16,14 @@ import Moshi.Match: @match
 using Symbolics: SymbolicT
 
 """
+Sentinel `SU.ShapeVecT()` used throughout this file to tag the "scalar shape"
+for `SU.term(...)` and `SU.Sym{...}(...)` constructions. A module-level const
+captures intent (a scalar has no shape vector) and removes the inline
+construction at each call site.
+"""
+const SCALAR_SHAPE = SU.ShapeVecT()
+
+"""
     _find_arrayop(expr)
 
 Find the first `ArrayOp` node in a symbolic expression, descending through
@@ -251,30 +259,57 @@ function _build_block_observed_lookup(block_eqs_meta, sys)
 end
 
 """
+    _tile_stencil!(row_idxs, col_idxs, row, n_tiles, rep_cols, N)
+
+Given the `rep_cols` (column indices of unknowns referenced by a representative
+equation at row `row`), push `(row, col)` pairs into `row_idxs`/`col_idxs` for
+every element of a block of size `n_tiles` that tiles this stencil pattern.
+
+For `n_tiles == 1` (the scalar-equation case) this reduces to pushing the
+input `(row, rep_cols...)` pairs — the stencil-tiling loop collapses to a
+single iteration with zero shift, since `col = row + (rep_col - row) = rep_col`.
+
+Columns are clamped to `1:N` so out-of-bounds offsets near block boundaries
+are dropped silently.
+"""
+function _tile_stencil!(row_idxs::Vector{Int}, col_idxs::Vector{Int},
+        row::Int, n_tiles::Int, rep_cols::Vector{Int}, N::Int)
+    offsets = [col - row for col in rep_cols]
+    for k in 0:(n_tiles - 1)
+        tile_row = row + k
+        tile_row > N && continue
+        for offset in offsets
+            col = tile_row + offset
+            1 <= col <= N || continue
+            push!(row_idxs, tile_row)
+            push!(col_idxs, col)
+        end
+    end
+    return nothing
+end
+
+"""
     _block_jacobian_sparsity(sys, block_eqs)
 
 Compute Jacobian sparsity from block stencil structure. For each block equation,
-the representative RHS has a fixed stencil pattern (which unknowns it references).
-This pattern is tiled across all N elements of the block, producing a banded/sparse
-matrix instead of a dense N×N pattern.
+the representative RHS has a fixed stencil pattern (which unknowns it references)
+which is tiled across all `scalar_count` elements of the block. For scalar
+(non-block) equations, the "tiling" is a single row — handled by passing
+`n_tiles = 1` to the same helper.
 
-For scalar (non-block) equations, sparsity is computed via `Symbolics.jacobian_sparsity`.
-
-Uses `_build_block_outputidxs` for consistent equation→du row mapping (same mapping
-used by `generate_rhs` for code generation).
+Uses `_build_block_outputidxs` for consistent equation→du row mapping (same
+mapping used by `generate_rhs` for code generation).
 
 !!! note
-    This assumes a spatially uniform stencil — every element in a block has the same
-    dependency offsets as the representative. This is correct for standard finite
-    difference discretizations on uniform grids but would be wrong for spatially-varying
-    stencils or non-uniform grids.
+    This assumes a spatially uniform stencil — every element in a block has the
+    same dependency offsets as the representative. This is correct for standard
+    finite difference discretizations on uniform grids but would be wrong for
+    spatially-varying stencils or non-uniform grids.
 """
 function _block_jacobian_sparsity(sys, block_eqs)
     N = length(unknowns(sys))
-    dvs = [unwrap(dv) for dv in unknowns(sys)]
+    dvs = SymbolicT[unwrap(dv) for dv in unknowns(sys)]
     eqs = equations(sys)
-
-    # Get the consistent equation→du row mapping
     outputidxs = _build_block_outputidxs(eqs, sys)
 
     row_idxs = Int[]
@@ -283,41 +318,11 @@ function _block_jacobian_sparsity(sys, block_eqs)
     for (i, eq) in enumerate(eqs)
         row = outputidxs[i]
         block = get(block_eqs, i, nothing)
+        n_tiles = (block !== nothing && block.scalar_count > 1) ? block.scalar_count : 1
 
-        if block !== nothing && block.scalar_count > 1
-            # Block equation: compute column offsets from the representative's RHS
-            # by finding which unknowns appear in it and computing their index offsets.
-            rep_rhs = unwrap(eq.rhs)
-
-            # Get column indices of unknowns referenced in the representative RHS
-            rep_sp = Symbolics.jacobian_sparsity([rep_rhs], dvs)
-            _, rep_cols, _ = SparseArrays.findnz(rep_sp)
-
-            # Compute offsets relative to the representative's row position
-            offsets = [col - row for col in rep_cols]
-
-            # Tile the offsets across all N elements of this block
-            n = block.scalar_count
-            for k in 0:(n - 1)
-                tile_row = row + k
-                tile_row > N && continue
-                for offset in offsets
-                    col = tile_row + offset
-                    if 1 <= col <= N
-                        push!(row_idxs, tile_row)
-                        push!(col_idxs, col)
-                    end
-                end
-            end
-        else
-            # Scalar equation: compute sparsity directly via Symbolics
-            scalar_sp = Symbolics.jacobian_sparsity([unwrap(eq.rhs)], dvs)
-            _, cols, _ = SparseArrays.findnz(scalar_sp)
-            for col in cols
-                push!(row_idxs, row)
-                push!(col_idxs, col)
-            end
-        end
+        rep_sp = Symbolics.jacobian_sparsity([unwrap(eq.rhs)], dvs)
+        _, rep_cols, _ = SparseArrays.findnz(rep_sp)
+        _tile_stencil!(row_idxs, col_idxs, row, n_tiles, rep_cols, N)
     end
 
     return SparseArrays.sparse(row_idxs, col_idxs, true, N, N)
@@ -385,7 +390,7 @@ function _shift_array_indices_multidim_sym(expr, shifts::Vector{Int})
                 push!(new_idxs, (k <= length(shifts) && shifts[k] != 0) ? idx + shifts[k] : idx)
             end
             return SU.term(getindex, args[1], new_idxs...;
-                type = SU.symtype(x), shape = SU.ShapeVecT())
+                type = SU.symtype(x), shape = SCALAR_SHAPE)
         end
     end
     return Postwalk(rw; filter = Returns(true))(expr)
@@ -532,7 +537,7 @@ function _rewrite_setarray_for_blocks(set_array::SetArray, block_info_list)
 
         # Allocate fresh symbolic loop variables (one per block dimension).
         loop_vars = [SU.Sym{SU.SymReal}(
-            Symbol("__blk_$(d)_$(bi.eq_idx)"); type = Int, shape = SU.ShapeVecT())
+            Symbol("__blk_$(d)_$(bi.eq_idx)"); type = Int, shape = SCALAR_SHAPE)
             for d in 1:bi.ndims]
         param_rhs = _parameterize_symbolic_rhs(rep_rhs, bi.base_idxs, loop_vars)
 
@@ -675,7 +680,7 @@ function _parameterize_symbolic_rhs(expr, base_idxs::Vector{Int}, loop_vars::Vec
                 push!(new_idxs, offset == 0 ? loop_vars[d] : loop_vars[d] + offset)
             end
             return SU.term(getindex, args[1], new_idxs...;
-                type = SU.symtype(x), shape = SU.ShapeVecT())
+                type = SU.symtype(x), shape = SCALAR_SHAPE)
         end
     end
     return Postwalk(rw; filter = Returns(true))(expr)
